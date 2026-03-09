@@ -21,7 +21,8 @@ const maskIP = (ip) => {
 async function handleRequest(request, env) {
   const clientUrl = new URL(request.url);
 
-  const NEXTDNS_ID         = env.NEXTDNS_ID   ?? '';
+  // 按逗号分割，支持多个 ID 随机负载均衡
+  const NEXTDNS_IDS        = (env.NEXTDNS_ID ?? '').split(',').map(s => s.trim()).filter(Boolean);
   const BASE_PATH          = env.BASE_PATH    ?? '';
   const FALLBACK_URL       = env.FALLBACK_URL ?? '';
   const PRIMARY_TIMEOUT_MS = parseInt(env.TIMEOUT_MS) || 2500;
@@ -37,12 +38,10 @@ async function handleRequest(request, env) {
     return new Response('Not Found', { status: 404 });
   }
 
-  if (!NEXTDNS_ID) {
+  if (NEXTDNS_IDS.length === 0) {
     return new Response('Server misconfiguration: NEXTDNS_ID not set', { status: 500 });
   }
 
-  // 直接访问时只有 CF-Connecting-IP
-  // 套了外层 CDN 时 X-Forwarded-For 第一个 IP 才是真实客户端 IP
   const cfIP      = request.headers.get('CF-Connecting-IP');
   const xffHeader = request.headers.get('X-Forwarded-For');
   const xffIP     = xffHeader ? xffHeader.split(',')[0].trim() : null;
@@ -96,8 +95,9 @@ async function handleRequest(request, env) {
 
   const devicePath = clientUrl.pathname.substring(basePath.length);
 
-  // 主上游 NextDNS
-  const primaryUrl  = new URL(`${NEXTDNS_BASE}/${NEXTDNS_ID}${devicePath}`);
+  // 随机选一个 ID，多个 ID 时概率均等分摊额度
+  const selectedId  = NEXTDNS_IDS[Math.floor(Math.random() * NEXTDNS_IDS.length)];
+  const primaryUrl  = new URL(`${NEXTDNS_BASE}/${selectedId}${devicePath}`);
   primaryUrl.search = clientUrl.search;
   if (clientSubnet) {
     primaryUrl.searchParams.set('ci', clientSubnet);
@@ -106,7 +106,6 @@ async function handleRequest(request, env) {
   // 备用上游
   const fallbackUrl  = new URL(FALLBACK_URL || DEFAULT_FALLBACK);
   fallbackUrl.search = clientUrl.search;
-  // 只有 Google DoH 支持 edns_client_subnet 参数，其他服务商忽略
   if (clientSubnet && fallbackUrl.hostname === 'dns.google') {
     fallbackUrl.searchParams.set('edns_client_subnet', clientSubnet);
   }
