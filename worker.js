@@ -1,10 +1,20 @@
 const NEXTDNS_BASE     = 'https://dns.nextdns.io';
 const DEFAULT_FALLBACK = 'https://dns.google/dns-query';
+const MAX_BODY         = 64 * 1024;
 
 const withTimeout = (fetchFn, ms) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
-  return fetchFn(controller.signal).finally(() => clearTimeout(timer));
+  return fetchFn(controller.signal)
+    .finally(() => clearTimeout(timer))
+    .catch(err => {
+      if (err.name === 'AbortError') {
+        const e = new Error('Timeout');
+        e.name = 'TimeoutError';
+        throw e;
+      }
+      throw err;
+    });
 };
 
 const maskIP = (ip) => {
@@ -24,7 +34,10 @@ async function handleRequest(request, env) {
   // 按逗号分割，支持多个 ID 随机负载均衡
   const NEXTDNS_IDS        = (env.NEXTDNS_ID ?? '').split(',').map(s => s.trim()).filter(Boolean);
   const BASE_PATH          = env.BASE_PATH ?? '';
-  const PRIMARY_TIMEOUT_MS = parseInt(env.TIMEOUT_MS) || 2500;
+  const PRIMARY_TIMEOUT_MS = (() => {
+    const n = parseInt(env.TIMEOUT_MS, 10);
+    return Number.isFinite(n) && n > 0 ? n : 2500;
+  })();
 
   const basePath = BASE_PATH
     ? '/' + BASE_PATH.replace(/^\//, '')
@@ -75,6 +88,11 @@ async function handleRequest(request, env) {
   const hasBody = !['GET', 'HEAD'].includes(request.method);
   let body = null;
   if (hasBody) {
+    // 超过 64KB 直接拒绝，符合 DNS 消息最大长度，防止异常大请求
+    const cl = request.headers.get('Content-Length');
+    if (cl && parseInt(cl, 10) > MAX_BODY) {
+      return new Response('Payload Too Large', { status: 413 });
+    }
     try {
       body = await request.arrayBuffer();
     } catch {
@@ -129,7 +147,7 @@ async function handleRequest(request, env) {
         PRIMARY_TIMEOUT_MS
       );
       const respHeaders = new Headers(resp.headers);
-      respHeaders.set('X-Fallback', primaryErr.name === 'AbortError' ? 'primary-timeout' : 'primary-error');
+      respHeaders.set('X-Fallback', primaryErr.name === 'TimeoutError' ? 'primary-timeout' : 'primary-error');
       return new Response(resp.body, {
         status:     resp.status,
         statusText: resp.statusText,
