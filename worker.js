@@ -1,42 +1,61 @@
-const NEXTDNS_BASE     = 'https://dns.nextdns.io';
-const DEFAULT_FALLBACK = 'https://dns.google/dns-query';
-const MAX_BODY         = 64 * 1024;
+const NEXTDNS_BASE        = 'https://dns.nextdns.io';
+const DEFAULT_FALLBACK    = 'https://dns.google/dns-query';
+const MAX_BODY            = 64 * 1024; // 64KB，符合 DNS 消息最大长度标准
+const DEFAULT_TIMEOUT_MS  = 2500;      // 主上游默认超时时间（毫秒）
+const FALLBACK_TIMEOUT_MS = 1500;      // 备用上游超时时间（毫秒）
 
-const withTimeout = (fetchFn, ms) => {
+// async/await + try/finally 确保 timer 在任何情况下都会被清除
+const withTimeout = async (fetchFn, ms) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
-  return fetchFn(controller.signal)
-    .finally(() => clearTimeout(timer))
-    .catch(err => {
-      if (err.name === 'AbortError') {
-        const e = new Error('Timeout');
-        e.name = 'TimeoutError';
-        throw e;
-      }
-      throw err;
-    });
+  try {
+    return await fetchFn(controller.signal);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      const e = new Error('Timeout');
+      e.name = 'TimeoutError';
+      throw e;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 const maskIP = (ip) => {
   if (ip.includes(':')) {
-    const sections = ip.split(':');
-    const missing  = 8 - sections.filter(s => s !== '').length;
-    const full     = ip.replace('::', ':' + '0:'.repeat(missing)).replace(/^:|:$/g, '');
-    return full.split(':').slice(0, 3).join(':') + '::/48';
-  } else {
-    return ip.split('.').slice(0, 3).join('.') + '.0/24';
+    // IPv4-mapped IPv6 地址（::ffff:x.x.x.x），提取内嵌 IPv4 处理
+    if (ip.toLowerCase().includes('::ffff:')) {
+      const v4 = ip.split(':').pop();
+      return v4 && v4.includes('.') ? maskIP(v4) : null;
+    }
+    // 用 split('::') 展开压缩形式，比字符串替换更可靠
+    const parts = ip.split('::');
+    const left  = parts[0] ? parts[0].split(':') : [];
+    const right = parts.length > 1 && parts[1] ? parts[1].split(':') : [];
+    const zeros = Array(8 - left.length - right.length).fill('0');
+    const full  = [...left, ...zeros, ...right];
+    // 符合 RFC 5952，压缩前导零（如 0db8 → db8）
+    const prefix = full.slice(0, 3).map(p => p.replace(/^0+/, '') || '0');
+    return prefix.join(':') + '::/48';
   }
+  return ip.split('.').slice(0, 3).join('.') + '.0/24';
 };
 
 async function handleRequest(request, env) {
   const clientUrl = new URL(request.url);
+
+  // DoH 只允许 GET 和 POST
+  if (!['GET', 'POST'].includes(request.method)) {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
 
   // 按逗号分割，支持多个 ID 随机负载均衡
   const NEXTDNS_IDS        = (env.NEXTDNS_ID ?? '').split(',').map(s => s.trim()).filter(Boolean);
   const BASE_PATH          = env.BASE_PATH ?? '';
   const PRIMARY_TIMEOUT_MS = (() => {
     const n = parseInt(env.TIMEOUT_MS, 10);
-    return Number.isFinite(n) && n > 0 ? n : 2500;
+    return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
   })();
 
   const basePath = BASE_PATH
@@ -71,30 +90,31 @@ async function handleRequest(request, env) {
 
   const clientSubnet = clientIP ? maskIP(clientIP) : null;
 
-  // 提前构建好 Headers，主备上游复用同一份，避免重复计算
-  // 只追加 cfIP，避免把从 XFF 读出来的 IP 再写回去造成重复
+  // 构建转发给上游的请求头
   const headers = new Headers(request.headers);
-  if (cfIP) {
-    headers.set(
-      'X-Forwarded-For',
-      xffHeader ? `${xffHeader}, ${cfIP}` : cfIP
-    );
+  // 直连时 XFF 为空，追加 cfIP（即用户真实 IP）
+  // 套了 CDN 时 XFF 已包含用户真实 IP，保持原样不追加，避免重复
+  if (!xffHeader && cfIP) {
+    headers.set('X-Forwarded-For', cfIP);
   }
   headers.delete('CF-Connecting-IP');
   headers.delete('CF-Ray');
   headers.delete('CF-Visitor');
   headers.delete('CF-IPCountry');
 
-  const hasBody = !['GET', 'HEAD'].includes(request.method);
+  const hasBody = request.method === 'POST';
   let body = null;
   if (hasBody) {
-    // 超过 64KB 直接拒绝，符合 DNS 消息最大长度，防止异常大请求
+    // 先检查 Content-Length 快速拦截，再验证实际大小防止伪造
     const cl = request.headers.get('Content-Length');
     if (cl && parseInt(cl, 10) > MAX_BODY) {
       return new Response('Payload Too Large', { status: 413 });
     }
     try {
       body = await request.arrayBuffer();
+      if (body.byteLength > MAX_BODY) {
+        return new Response('Payload Too Large', { status: 413 });
+      }
     } catch {
       return new Response('Failed to read request body', { status: 400 });
     }
@@ -108,7 +128,13 @@ async function handleRequest(request, env) {
       redirect: 'follow',
       signal,
     });
-    const response    = await fetch(req);
+    const response = await fetch(req);
+    // 上游返回 5xx 时抛异常，触发切换备用上游
+    if (response.status >= 500) {
+      const err = new Error(`Upstream error: ${response.status}`);
+      err.name = 'UpstreamError';
+      throw err;
+    }
     const respHeaders = new Headers(response.headers);
     respHeaders.set('X-Proxied-By', 'CF-Worker-NextDNS');
     return new Response(response.body, {
@@ -140,11 +166,11 @@ async function handleRequest(request, env) {
       PRIMARY_TIMEOUT_MS
     );
   } catch (primaryErr) {
-    // 主上游失败，切备用（备用同样有超时控制）
+    // 主上游失败（超时、网络错误、5xx），切备用
     try {
       const resp        = await withTimeout(
         (signal) => tryFetch(fallbackUrl.toString(), signal),
-        PRIMARY_TIMEOUT_MS
+        FALLBACK_TIMEOUT_MS
       );
       const respHeaders = new Headers(resp.headers);
       respHeaders.set('X-Fallback', primaryErr.name === 'TimeoutError' ? 'primary-timeout' : 'primary-error');
@@ -153,8 +179,8 @@ async function handleRequest(request, env) {
         statusText: resp.statusText,
         headers:    respHeaders,
       });
-    } catch (err) {
-      return new Response(`Bad Gateway: ${err.message}`, { status: 502 });
+    } catch {
+      return new Response('Bad Gateway', { status: 502 });
     }
   }
 }
