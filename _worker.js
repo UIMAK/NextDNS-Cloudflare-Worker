@@ -26,7 +26,7 @@ const CDN_HEADERS_TO_REMOVE = [
   // Cloudflare
   'CF-Connecting-IP', 'CF-Ray', 'CF-Visitor', 'CF-IPCountry',
   // 腾讯 EdgeOne
-  'EO-Connecting-IP', 'EO-LOG-UUID', 'EO-Bot-Tag', 'CDN-Loop',
+  'EO-Connecting-IP', 'EO-LOG-UUID', 'EO-Bot-Tag', 'CDN-Loop', 'EO-Client-IP',
   // 阿里云 CDN
   'Ali-CDN-Real-IP',
   // 通用
