@@ -24,13 +24,20 @@ const CDN_IP_HEADERS = [
 // 这些头是 CDN 平台内部使用的，不应透传给上游 DNS
 const CDN_HEADERS_TO_REMOVE = [
   // Cloudflare
-  'CF-Connecting-IP', 'CF-Ray', 'CF-Visitor', 'CF-IPCountry',
-  // 腾讯 EdgeOne
+  'CF-Connecting-IP', 'CF-Ray', 'CF-Visitor', 'CF-IPCountry', 'CF-Worker', 'CF-Access-Client-Id',
+  // 腾讯 EdgeOne / CDN
   'EO-Connecting-IP', 'EO-LOG-UUID', 'EO-Bot-Tag', 'CDN-Loop', 'EO-Client-IP',
+  'X-Tls-Version', 'X-Client-Proto',
   // 阿里云 CDN
-  'Ali-CDN-Real-IP', 'ali-real-client-ip',
-  // 通用
-  'X-Real-IP', 'Host',
+  'Ali-CDN-Real-IP', 'ali-real-client-ip', 'Ali-CDN-Real-IP-From', 'X-Forwarded-For-Pound',
+  // AWS CloudFront
+  'X-Amz-Cf-Id', 'CloudFront-Forwarded-Proto', 'CloudFront-Is-Mobile-Viewer',
+  // 其他/通用真实 IP (Akamai, Fastly, etc.)
+  'True-Client-IP', 'Akamai-Client-IP', 'Fastly-Client-IP',
+  // 代理与协议信息
+  'X-Real-IP', 'Host', 'Forwarded', 'X-Forwarded-Proto', 'X-Forwarded-Host', 'X-Forwarded-Port',
+  // 云函数/网关特征
+  'X-App-Id', 'X-Gateway-Region'
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
