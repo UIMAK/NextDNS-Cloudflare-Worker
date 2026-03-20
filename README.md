@@ -108,3 +108,5 @@ ECS（EDNS Client Subnet）让 DNS 服务器知道客户端大致位置，从而
 **Q：Worker 免费套餐够用吗？**
 
 Cloudflare Workers 免费套餐每天有 10 万次请求额度，个人使用完全够用。
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/QSDR2s1d/NextDNS-Cloudflare-Worker)
