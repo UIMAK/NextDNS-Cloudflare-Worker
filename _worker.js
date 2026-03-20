@@ -30,7 +30,7 @@ const CDN_HEADERS_TO_REMOVE = [
   // 阿里云 CDN
   'Ali-CDN-Real-IP', 'ali-real-client-ip',
   // 通用
-  'X-Real-IP',
+  'X-Real-IP', 'Host',
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
