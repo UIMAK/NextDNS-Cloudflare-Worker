@@ -112,3 +112,5 @@ Note: ECS parameters are only forwarded when the fallback is Google DoH. Other p
 **Q: Is the free Cloudflare Workers plan enough?**
 
 Yes. The free plan includes 100,000 requests per day, which is more than sufficient for personal use.
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/QSDR2s1d/NextDNS-Cloudflare-Worker)
