@@ -23,6 +23,12 @@ const CORS_HEADERS = {
   'Access-Control-Max-Age':       '86400',
 };
 
+// ── 上游请求头（固定不变，模块级复用）────────────────────────────────────────
+const UPSTREAM_HEADERS = new Headers({
+  'Content-Type': 'application/dns-message',
+  'Accept':       'application/dns-message',
+});
+
 // ── CDN 真实客户端 IP 头配置 ──────────────────────────────────────────────────
 // 按优先级从高到低排列，第一个匹配到有值的头即为真实客户端 IP
 const CDN_IP_HEADERS = [
@@ -81,14 +87,18 @@ function skipName(buf, off) {
   while (o < buf.length) {
     const len = buf[o];
     if (len === 0) return o + 1;
-    if ((len & 0xc0) === 0xc0) return o + 2;
+    if ((len & 0xc0) === 0xc0) return o + 2; // 压缩指针，直接跳过 2 字节
     o += 1 + len;
   }
   return o;
 }
+
 function skipQuestion(buf, off) { return skipName(buf, off) + 4; }
+
+// [fix] 增加边界检查，防止畸形报文导致 NaN 传播
 function skipRR(buf, off) {
   const endName = skipName(buf, off);
+  if (endName + 10 > buf.length) throw new RangeError('RR truncated');
   return endName + 10 + readU16(buf, endName + 8);
 }
 
@@ -130,6 +140,7 @@ function buildEcsOption(ipBytes, family, prefixLen) {
   for (let i = 0; i < count; i++) trimmed[i] = ipBytes[i] || 0;
   const rem = prefixLen % 8;
   if (rem && count > 0) trimmed[count - 1] &= (0xff << (8 - rem));
+  // optData = FAMILY(2) + SOURCE_PREFIX(1) + SCOPE_PREFIX(1) + ADDRESS(n)
   const optData = concatUint8(writeU16BE(family),
     new Uint8Array([prefixLen & 0xff, 0]), trimmed);
   return concatUint8(writeU16BE(8), writeU16BE(optData.length), optData);
@@ -145,6 +156,7 @@ function injectECS(buf, clientIp) {
   const optIdx = addRecs.findIndex(r => r.type === 41);
 
   if (optIdx !== -1) {
+    // 已存在 OPT record：移除旧的 ECS option（code=8），追加新的
     const rec = addRecs[optIdx];
     const options = [];
     let p = rec.rdataStart;
@@ -152,9 +164,10 @@ function injectECS(buf, clientIp) {
       const code = readU16(buf, p), len = readU16(buf, p + 2);
       const optEnd = p + 4 + len;
       if (optEnd > rec.rdataEnd) break;
-      if (code !== 8) options.push(buf.slice(p, optEnd));
+      if (code !== 8) options.push(buf.slice(p, optEnd)); // 保留非 ECS option
       p = optEnd;
     }
+    // options 可能为空数组，concatUint8 正确处理空输入
     const newRdata = concatUint8(...options, ecsOpt);
     return concatUint8(
       buf.slice(0, rec.nameEnd + 8),
@@ -167,8 +180,12 @@ function injectECS(buf, clientIp) {
   // 没有 OPT record，新建一个并追加
   const arCount = readU16(buf, 10);
   const optRecord = concatUint8(
-    new Uint8Array([0x00]), writeU16BE(41), writeU16BE(4096),
-    new Uint8Array([0, 0, 0, 0]), writeU16BE(ecsOpt.length), ecsOpt
+    new Uint8Array([0x00]),   // root name
+    writeU16BE(41),           // TYPE = OPT
+    writeU16BE(4096),         // CLASS = requestor's UDP payload size
+    new Uint8Array([0, 0, 0, 0]), // TTL = extended RCODE + flags
+    writeU16BE(ecsOpt.length),
+    ecsOpt
   );
   const newBuf = concatUint8(buf, optRecord);
   const ar2 = arCount + 1;
@@ -202,23 +219,24 @@ function parseIPv6(str) {
   }
   const parts = main.split('::');
   if (parts.length > 2) return null;
-  const left = parts[0] ? parts[0].split(':').filter(Boolean) : [];
+  const left  = parts[0] ? parts[0].split(':').filter(Boolean) : [];
   const right = parts[1] ? parts[1].split(':').filter(Boolean) : [];
-  const leftVals = left.map(h => parseInt(h, 16));
+  const leftVals  = left.map(h => parseInt(h, 16));
   const rightVals = right.map(h => parseInt(h, 16));
   if (leftVals.some(isNaN) || rightVals.some(isNaN)) return null;
+  // v4bytes 已占 2 个 word，missing 计算已预留，无需额外 pop()
   const missing = 8 - (leftVals.length + rightVals.length + (v4bytes ? 2 : 0));
   if (missing < 0) return null;
   const words = [...leftVals, ...Array(missing).fill(0), ...rightVals];
+  // [fix] 删除多余的 words.pop()，直接追加 v4 的两个 word
   if (v4bytes) {
-    words.pop();
     words.push((v4bytes[0] << 8) | v4bytes[1]);
     words.push((v4bytes[2] << 8) | v4bytes[3]);
   }
   if (words.length !== 8) return null;
   const out = new Uint8Array(16);
   for (let i = 0; i < 8; i++) {
-    out[i * 2] = (words[i] >> 8) & 0xff;
+    out[i * 2]     = (words[i] >> 8) & 0xff;
     out[i * 2 + 1] = words[i] & 0xff;
   }
   return out;
@@ -237,14 +255,20 @@ function parseIp(str) {
 function isPublicIPv4(ip) {
   const b = parseIPv4(ip);
   if (!b) return false;
-  const n = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
-  const inRange = (base, mask) => (n & mask) === base;
+  // [fix] >>> 0 强制转换为无符号 32 位整数，避免首字节 >= 128 时位运算产生负数
+  // 导致 172.16/12、192.168/16、169.254/16 等私网段被误判为公网
+  const n = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+  const inRange = (base, mask) => (n & mask) >>> 0 === (base >>> 0);
   return !(
-    inRange(0x0a000000, 0xff000000) || inRange(0xac100000, 0xfff00000) ||
-    inRange(0xc0a80000, 0xffff0000) || inRange(0x7f000000, 0xff000000) ||
-    inRange(0xa9fe0000, 0xffff0000) || inRange(0x64400000, 0xffc00000) ||
-    inRange(0x00000000, 0xff000000) ||
-    (b[0] & 0xf0) === 0xe0 || (b[0] & 0xf0) === 0xf0
+    inRange(0x0a000000, 0xff000000) || // 10.0.0.0/8
+    inRange(0xac100000, 0xfff00000) || // 172.16.0.0/12
+    inRange(0xc0a80000, 0xffff0000) || // 192.168.0.0/16
+    inRange(0x7f000000, 0xff000000) || // 127.0.0.0/8
+    inRange(0xa9fe0000, 0xffff0000) || // 169.254.0.0/16
+    inRange(0x64400000, 0xffc00000) || // 100.64.0.0/10 (CGNAT)
+    inRange(0x00000000, 0xff000000) || // 0.0.0.0/8
+    (b[0] & 0xf0) === 0xe0 ||          // 224.0.0.0/4 (组播)
+    (b[0] & 0xf0) === 0xf0             // 240.0.0.0/4 (保留)
   );
 }
 
@@ -253,11 +277,11 @@ function isPublicIPv6(ip) {
   if (!b) return false;
   const b0 = b[0], b1 = b[1];
   return !(
-    b.every(x => x === 0) ||
-    (b.slice(0, 15).every(x => x === 0) && b[15] === 1) ||
-    (b0 & 0xfe) === 0xfc ||
-    (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||
-    b0 === 0xff
+    b.every(x => x === 0) ||                              // ::（未指定）
+    (b.slice(0, 15).every(x => x === 0) && b[15] === 1) || // ::1（回环）
+    (b0 & 0xfe) === 0xfc ||                               // fc00::/7（ULA）
+    (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||              // fe80::/10（链路本地）
+    b0 === 0xff                                           // ff00::/8（组播）
   );
 }
 
@@ -305,7 +329,6 @@ async function handleRequest(request, env) {
     return new Response('Server misconfiguration: NEXTDNS_ID not set', { status: 500 });
   }
 
-  // FALLBACK_URL 格式校验
   let fallbackBase;
   try {
     fallbackBase = new URL(env.FALLBACK_URL || DEFAULT_FALLBACK).toString();
@@ -355,18 +378,12 @@ async function handleRequest(request, env) {
     }
   }
 
-  // 构建转发给上游的请求头（统一用 POST 转发）
-  // ECS 已在 DNS 报文层注入子网，无需再传 X-Forwarded-For 暴露完整 IP
-  const upstreamHeaders = new Headers();
-  upstreamHeaders.set('Content-Type', 'application/dns-message');
-  upstreamHeaders.set('Accept', 'application/dns-message');
-
   const devicePath = clientUrl.pathname.substring(basePath.length);
 
   const tryFetch = async (upstreamUrl, signal) => {
     const req = new Request(upstreamUrl, {
       method:   'POST',
-      headers:  upstreamHeaders,
+      headers:  UPSTREAM_HEADERS, // 复用模块级常量
       body:     mutatedWire,
       redirect: 'follow',
       signal,
