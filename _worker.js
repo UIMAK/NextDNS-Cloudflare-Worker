@@ -2,7 +2,7 @@
 // NextDNS Reverse Proxy - Cloudflare Worker (Modules 格式)
 // ================================================================
 // 环境变量配置（CF Dashboard -> Workers -> Settings -> Variables）：
-//   NEXTDNS_ID   : 你的 NextDNS 配置 ID（必填），多个用逗号分隔
+//   NEXTDNS_ID   : 你的 NextDNS 配置 ID（必填），多个用逗号分隔，如 d43bb9,b3f18b
 //   BASE_PATH    : 自定义路径，不填默认 dns-query
 //   FALLBACK_URL : 备用 DoH，不填默认 https://dns.google/dns-query
 //   TIMEOUT_MS   : 主上游超时时间（毫秒），不填默认 2500
@@ -17,12 +17,15 @@ const ECS_V4_PREFIX       = 24;        // IPv4 ECS 前缀长度
 const ECS_V6_PREFIX       = 48;        // IPv6 ECS 前缀长度
 
 // ── CDN 真实客户端 IP 头配置 ──────────────────────────────────────────────────
+// 按优先级从高到低排列，第一个匹配到有值的头即为真实客户端 IP
+// CF-Connecting-IP 排在最后：直连 CF 时它是设备真实 IP；
+// 套了外层 CDN 时它是 CDN 节点 IP，此时应优先用 X-Forwarded-For 里的设备 IP
 const CDN_IP_HEADERS = [
-  'EO-Client-IP',        // 腾讯 EdgeOne
-  'ali-real-client-ip',  // 阿里云 CDN
-  'CF-Connecting-IP',    // Cloudflare
-  'X-Forwarded-For',     // 通用（取第一个值）
+  'EO-Client-IP',        // 腾讯 EdgeOne（专用真实 IP 头）
+  'ali-real-client-ip',  // 阿里云 CDN（专用真实 IP 头）
+  'X-Forwarded-For',     // 通用（取第一个值，套 CDN 时第一个是设备真实 IP）
   'X-Real-IP',           // 通用兜底
+  'CF-Connecting-IP',    // 直连 CF 时的设备真实 IP（套 CDN 时是 CDN 节点 IP，排最后）
 ];
 
 // ── withTimeout ───────────────────────────────────────────────────────────────
