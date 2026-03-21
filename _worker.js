@@ -3,7 +3,8 @@
 // ================================================================
 // 环境变量配置（CF Dashboard -> Workers -> Settings -> Variables）：
 //   NEXTDNS_ID   : 你的 NextDNS 配置 ID（必填），多个用逗号分隔
-//   BASE_PATH    : 自定义路径，不填默认 dns-query
+//   BASE_PATH    : 自定义路径前缀，不填默认 dns-query
+//                  注意：不要设为 "/"，否则会匹配所有路径
 //   FALLBACK_URL : 备用 DoH，不填默认 https://dns.google/dns-query
 //   TIMEOUT_MS   : 主上游超时时间（毫秒），不填默认 2500
 // ================================================================
@@ -39,6 +40,10 @@ const CDN_IP_HEADERS = [
   'X-Real-IP',           // 通用兜底
 ];
 
+// ── 统一错误响应（携带 CORS 头，避免浏览器端 CORS 拦截错误信息）──────────────
+const errResp = (body, status) =>
+  new Response(body, { status, headers: { 'Access-Control-Allow-Origin': '*' } });
+
 // ── withTimeout ───────────────────────────────────────────────────────────────
 const withTimeout = async (fetchFn, ms) => {
   const controller = new AbortController();
@@ -68,6 +73,23 @@ const getClientIP = (headers) => {
   return null;
 };
 
+// ── 路径安全解码 ──────────────────────────────────────────────────────────────
+// 循环解码直至稳定，彻底防止 %252e%252e 双重编码绕过；
+// 捕获畸形编码（如 %E0%A4%A）的 URIError，降级返回空串
+const safeDecodePath = (raw) => {
+  if (!raw) return '';
+  try {
+    let prev, curr = raw;
+    do {
+      prev = curr;
+      curr = decodeURIComponent(curr);
+    } while (curr !== prev);
+    return '/' + curr.replace(/^\/+/, '').replace(/\.\./g, '');
+  } catch {
+    return ''; // 畸形编码，忽略子路径
+  }
+};
+
 // ═════════════════════════════════════════════════════════════════════════════
 // DNS 报文层 ECS 注入
 // ═════════════════════════════════════════════════════════════════════════════
@@ -79,30 +101,46 @@ function base64urlDecode(s) {
   return Uint8Array.from(bin, c => c.charCodeAt(0));
 }
 
-function readU16(buf, off) { return (buf[off] << 8) | buf[off + 1]; }
+// 增加出界检查，防止越界返回 NaN 污染后续计算
+function readU16(buf, off) {
+  if (off + 1 >= buf.length) throw new RangeError('readU16 out of bounds');
+  return (buf[off] << 8) | buf[off + 1];
+}
+
 function writeU16BE(value) { return new Uint8Array([value >> 8, value & 0xff]); }
 
+// 压缩指针分支增加 o+1 边界检查
 function skipName(buf, off) {
   let o = off;
   while (o < buf.length) {
     const len = buf[o];
     if (len === 0) return o + 1;
-    if ((len & 0xc0) === 0xc0) return o + 2; // 压缩指针，直接跳过 2 字节
+    if ((len & 0xc0) === 0xc0) {
+      if (o + 1 >= buf.length) throw new RangeError('Compression pointer truncated');
+      return o + 2;
+    }
     o += 1 + len;
   }
   return o;
 }
 
-function skipQuestion(buf, off) { return skipName(buf, off) + 4; }
+// 入口边界检查
+function skipQuestion(buf, off) {
+  if (off >= buf.length) throw new RangeError('Question truncated');
+  return skipName(buf, off) + 4;
+}
 
-// [fix] 增加边界检查，防止畸形报文导致 NaN 传播
+// 入口 + 出口双重边界检查
 function skipRR(buf, off) {
+  if (off >= buf.length) throw new RangeError('RR truncated');
   const endName = skipName(buf, off);
-  if (endName + 10 > buf.length) throw new RangeError('RR truncated');
+  if (endName + 10 > buf.length) throw new RangeError('RR header truncated');
   return endName + 10 + readU16(buf, endName + 8);
 }
 
+// 最小报文长度检查
 function findSections(buf) {
+  if (buf.length < 12) throw new RangeError('DNS message too short');
   const qd = readU16(buf, 4), an = readU16(buf, 6),
         ns = readU16(buf, 8), ar = readU16(buf, 10);
   let off = 12;
@@ -112,14 +150,18 @@ function findSections(buf) {
   return { ar, additionalStart: off };
 }
 
+// nameEnd、rdataEnd 双重越界检查
 function parseAdditionalRecords(buf, arStart, arCount) {
   const recs = []; let off = arStart;
   for (let i = 0; i < arCount; i++) {
+    if (off >= buf.length) break;
     const nameEnd = skipName(buf, off);
-    const type = readU16(buf, nameEnd);
-    const rdlen = readU16(buf, nameEnd + 8);
+    if (nameEnd + 10 > buf.length) throw new RangeError('Additional RR header truncated');
+    const type       = readU16(buf, nameEnd);
+    const rdlen      = readU16(buf, nameEnd + 8);
     const rdataStart = nameEnd + 10;
-    const rdataEnd = rdataStart + rdlen;
+    const rdataEnd   = rdataStart + rdlen;
+    if (rdataEnd > buf.length) throw new RangeError('Additional RR rdata truncated');
     recs.push({ nameEnd, type, rdataStart, rdataEnd });
     off = rdataEnd;
   }
@@ -180,9 +222,9 @@ function injectECS(buf, clientIp) {
   // 没有 OPT record，新建一个并追加
   const arCount = readU16(buf, 10);
   const optRecord = concatUint8(
-    new Uint8Array([0x00]),   // root name
-    writeU16BE(41),           // TYPE = OPT
-    writeU16BE(4096),         // CLASS = requestor's UDP payload size
+    new Uint8Array([0x00]),       // root name
+    writeU16BE(41),               // TYPE = OPT
+    writeU16BE(4096),             // CLASS = requestor's UDP payload size
     new Uint8Array([0, 0, 0, 0]), // TTL = extended RCODE + flags
     writeU16BE(ecsOpt.length),
     ecsOpt
@@ -228,7 +270,6 @@ function parseIPv6(str) {
   const missing = 8 - (leftVals.length + rightVals.length + (v4bytes ? 2 : 0));
   if (missing < 0) return null;
   const words = [...leftVals, ...Array(missing).fill(0), ...rightVals];
-  // [fix] 删除多余的 words.pop()，直接追加 v4 的两个 word
   if (v4bytes) {
     words.push((v4bytes[0] << 8) | v4bytes[1]);
     words.push((v4bytes[2] << 8) | v4bytes[3]);
@@ -255,8 +296,7 @@ function parseIp(str) {
 function isPublicIPv4(ip) {
   const b = parseIPv4(ip);
   if (!b) return false;
-  // [fix] >>> 0 强制转换为无符号 32 位整数，避免首字节 >= 128 时位运算产生负数
-  // 导致 172.16/12、192.168/16、169.254/16 等私网段被误判为公网
+  // >>> 0 强制转换为无符号 32 位整数，避免首字节 >= 128 时位运算产生负数
   const n = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
   const inRange = (base, mask) => (n & mask) >>> 0 === (base >>> 0);
   return !(
@@ -276,12 +316,27 @@ function isPublicIPv6(ip) {
   const b = parseIPv6(ip);
   if (!b) return false;
   const b0 = b[0], b1 = b[1];
+
+  // [fix] 补充 IPv4-mapped (::ffff:0:0/96) 和 NAT64 (64:ff9b::/96) 地址段
+  // 这两类地址的真实公网性取决于其内嵌的 IPv4 地址，需提取后单独判断
+  const isV4Mapped =
+    b.slice(0, 10).every(x => x === 0) && b[10] === 0xff && b[11] === 0xff;
+  const isNAT64 =
+    b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b &&
+    b.slice(4, 12).every(x => x === 0);
+
+  if (isV4Mapped || isNAT64) {
+    // 提取内嵌的 IPv4 地址（最后 4 字节），委托给 isPublicIPv4 判断
+    const v4 = `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
+    return isPublicIPv4(v4);
+  }
+
   return !(
-    b.every(x => x === 0) ||                              // ::（未指定）
+    b.every(x => x === 0) ||                               // ::（未指定）
     (b.slice(0, 15).every(x => x === 0) && b[15] === 1) || // ::1（回环）
-    (b0 & 0xfe) === 0xfc ||                               // fc00::/7（ULA）
-    (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||              // fe80::/10（链路本地）
-    b0 === 0xff                                           // ff00::/8（组播）
+    (b0 & 0xfe) === 0xfc ||                                // fc00::/7（ULA）
+    (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||               // fe80::/10（链路本地）
+    b0 === 0xff                                            // ff00::/8（组播）
   );
 }
 
@@ -304,7 +359,7 @@ async function handleRequest(request, env) {
 
   // DoH 只允许 GET 和 POST
   if (!['GET', 'POST'].includes(request.method)) {
-    return new Response('Method Not Allowed', { status: 405 });
+    return errResp('Method Not Allowed', 405);
   }
 
   const NEXTDNS_IDS        = (env.NEXTDNS_ID ?? '').split(',').map(s => s.trim()).filter(Boolean);
@@ -314,19 +369,19 @@ async function handleRequest(request, env) {
     return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
   })();
 
-  const basePath = BASE_PATH
-    ? '/' + BASE_PATH.replace(/^\//, '')
-    : '/dns-query';
+  // [fix] 过滤掉纯斜杠配置（BASE_PATH='/' 会匹配所有路径，是常见配置失误）
+  const normalizedBase = BASE_PATH.replace(/^\/+|\/+$/g, ''); // 去除首尾斜杠
+  const basePath = normalizedBase ? `/${normalizedBase}` : '/dns-query';
 
   if (
     clientUrl.pathname !== basePath &&
     !clientUrl.pathname.startsWith(basePath + '/')
   ) {
-    return new Response('Not Found', { status: 404 });
+    return errResp('Not Found', 404);
   }
 
   if (NEXTDNS_IDS.length === 0) {
-    return new Response('Server misconfiguration: NEXTDNS_ID not set', { status: 500 });
+    return errResp('Server misconfiguration: NEXTDNS_ID not set', 500);
   }
 
   let fallbackBase;
@@ -343,28 +398,28 @@ async function handleRequest(request, env) {
   let dnsWire;
   if (request.method === 'GET') {
     const dnsParam = clientUrl.searchParams.get('dns');
-    if (!dnsParam) return new Response('Missing dns parameter', { status: 400 });
+    if (!dnsParam) return errResp('Missing dns parameter', 400);
     try {
       dnsWire = base64urlDecode(dnsParam);
     } catch {
-      return new Response('Invalid dns parameter', { status: 400 });
+      return errResp('Invalid dns parameter', 400);
     }
   } else {
     // POST 请求必须携带正确的 Content-Type
     const ct = request.headers.get('Content-Type') || '';
     if (!ct.startsWith('application/dns-message')) {
-      return new Response('Unsupported Media Type', { status: 415 });
+      return errResp('Unsupported Media Type', 415);
     }
     const cl = request.headers.get('Content-Length');
     if (cl && parseInt(cl, 10) > MAX_BODY) {
-      return new Response('Payload Too Large', { status: 413 });
+      return errResp('Payload Too Large', 413);
     }
     try {
       const buf = await request.arrayBuffer();
-      if (buf.byteLength > MAX_BODY) return new Response('Payload Too Large', { status: 413 });
+      if (buf.byteLength > MAX_BODY) return errResp('Payload Too Large', 413);
       dnsWire = new Uint8Array(buf);
     } catch {
-      return new Response('Failed to read request body', { status: 400 });
+      return errResp('Failed to read request body', 400);
     }
   }
 
@@ -378,12 +433,12 @@ async function handleRequest(request, env) {
     }
   }
 
-  const devicePath = clientUrl.pathname.substring(basePath.length);
+  const devicePath = safeDecodePath(clientUrl.pathname.substring(basePath.length));
 
   const tryFetch = async (upstreamUrl, signal) => {
     const req = new Request(upstreamUrl, {
       method:   'POST',
-      headers:  UPSTREAM_HEADERS, // 复用模块级常量
+      headers:  UPSTREAM_HEADERS,
       body:     mutatedWire,
       redirect: 'follow',
       signal,
@@ -428,7 +483,7 @@ async function handleRequest(request, env) {
         headers:    respHeaders,
       });
     } catch {
-      return new Response('Bad Gateway', { status: 502 });
+      return errResp('Bad Gateway', 502);
     }
   }
 }
