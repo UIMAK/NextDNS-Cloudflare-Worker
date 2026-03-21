@@ -2,7 +2,7 @@
 // NextDNS Reverse Proxy - Cloudflare Worker (Modules 格式)
 // ================================================================
 // 环境变量配置（CF Dashboard -> Workers -> Settings -> Variables）：
-//   NEXTDNS_ID   : 你的 NextDNS 配置 ID（必填），多个用逗号分隔，如 d43bb9,b3f18b
+//   NEXTDNS_ID   : 你的 NextDNS 配置 ID（必填），多个用逗号分隔
 //   BASE_PATH    : 自定义路径，不填默认 dns-query
 //   FALLBACK_URL : 备用 DoH，不填默认 https://dns.google/dns-query
 //   TIMEOUT_MS   : 主上游超时时间（毫秒），不填默认 2500
