@@ -42,7 +42,7 @@ const CDN_IP_HEADERS = [
 
 // ── 统一错误响应（携带 CORS 头，避免浏览器端 CORS 拦截错误信息）──────────────
 const errResp = (body, status) =>
-  new Response(body, { status, headers: { 'Access-Control-Allow-Origin': '*' } });
+  new Response(body, { status, headers: CORS_HEADERS });
 
 // ── withTimeout ───────────────────────────────────────────────────────────────
 const withTimeout = async (fetchFn, ms) => {
@@ -67,7 +67,7 @@ const getClientIP = (headers) => {
   for (const name of CDN_IP_HEADERS) {
     const val = headers.get(name);
     if (!val) continue;
-    const ip = val.split(',')[0].trim();
+    const ip = val.split(',')[0].trim().replace(/^\[|\]$/g, '');
     if (ip) return ip;
   }
   return null;
@@ -77,14 +77,19 @@ const getClientIP = (headers) => {
 // 循环解码直至稳定，彻底防止 %252e%252e 双重编码绕过；
 // 捕获畸形编码（如 %E0%A4%A）的 URIError，降级返回空串
 const safeDecodePath = (raw) => {
-  if (!raw) return '';
+  if (!raw || raw === '/') return '';
   try {
     let prev, curr = raw;
     do {
       prev = curr;
       curr = decodeURIComponent(curr);
     } while (curr !== prev);
-    return '/' + curr.replace(/^\/+/, '').replace(/\.\./g, '');
+    const cleaned = curr
+      .replace(/^\/+/, '')
+      .split('/')
+      .filter(seg => seg !== '..')
+      .join('/');
+    return '/' + cleaned;
   } catch {
     return ''; // 畸形编码，忽略子路径
   }
@@ -95,6 +100,8 @@ const safeDecodePath = (raw) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 function base64urlDecode(s) {
+  if (s.length % 4 === 1) throw new Error('Invalid base64url length');
+  if (!/^[A-Za-z0-9_-]+$/.test(s)) throw new Error('Invalid base64url characters');
   const pad = s.length % 4 === 2 ? '==' : s.length % 4 === 3 ? '=' : '';
   const b64 = s.replace(/-/g, '+').replace(/_/g, '/') + pad;
   const bin = atob(b64);
@@ -109,13 +116,16 @@ function readU16(buf, off) {
 
 function writeU16BE(value) { return new Uint8Array([value >> 8, value & 0xff]); }
 
-// 压缩指针分支增加 o+1 边界检查
+// [fix] 增加跳转计数器上限，防止标签扫描失控；压缩指针增加 o+1 边界检查
 function skipName(buf, off) {
   let o = off;
+  let steps = 0;
   while (o < buf.length) {
+    if (++steps > 255) throw new RangeError('DNS name too long or pointer loop');
     const len = buf[o];
     if (len === 0) return o + 1;
     if ((len & 0xc0) === 0xc0) {
+      // 压缩指针：本函数只负责跳过，不跟随指针，因此不会产生指针循环
       if (o + 1 >= buf.length) throw new RangeError('Compression pointer truncated');
       return o + 2;
     }
@@ -317,8 +327,8 @@ function isPublicIPv6(ip) {
   if (!b) return false;
   const b0 = b[0], b1 = b[1];
 
-  // [fix] 补充 IPv4-mapped (::ffff:0:0/96) 和 NAT64 (64:ff9b::/96) 地址段
-  // 这两类地址的真实公网性取决于其内嵌的 IPv4 地址，需提取后单独判断
+  // 补充 IPv4-mapped (::ffff:0:0/96) 和 NAT64 (64:ff9b::/96) 地址段
+  // 这两类地址的公网性取决于内嵌的 IPv4 地址，提取后委托 isPublicIPv4 判断
   const isV4Mapped =
     b.slice(0, 10).every(x => x === 0) && b[10] === 0xff && b[11] === 0xff;
   const isNAT64 =
@@ -326,7 +336,6 @@ function isPublicIPv6(ip) {
     b.slice(4, 12).every(x => x === 0);
 
   if (isV4Mapped || isNAT64) {
-    // 提取内嵌的 IPv4 地址（最后 4 字节），委托给 isPublicIPv4 判断
     const v4 = `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
     return isPublicIPv4(v4);
   }
@@ -369,8 +378,8 @@ async function handleRequest(request, env) {
     return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
   })();
 
-  // [fix] 过滤掉纯斜杠配置（BASE_PATH='/' 会匹配所有路径，是常见配置失误）
-  const normalizedBase = BASE_PATH.replace(/^\/+|\/+$/g, ''); // 去除首尾斜杠
+  // 过滤掉纯斜杠配置（BASE_PATH='/' 会匹配所有路径，是常见配置失误）
+  const normalizedBase = BASE_PATH.replace(/^\/+|\/+$/g, '');
   const basePath = normalizedBase ? `/${normalizedBase}` : '/dns-query';
 
   if (
@@ -423,6 +432,9 @@ async function handleRequest(request, env) {
     }
   }
 
+  // DNS 报文最小长度校验（12 字节头部），过短报文直接拒绝
+  if (dnsWire.length < 12) return errResp('Invalid DNS message', 400);
+
   // 注入 ECS，遇到畸形报文时静默降级为透传原始报文
   let mutatedWire = dnsWire;
   if (isPublicIp(clientIP)) {
@@ -449,10 +461,20 @@ async function handleRequest(request, env) {
       err.name = 'UpstreamError';
       throw err;
     }
+
+    // 读取为 buffer，确保 Content-Length 可靠
+    // DNS 报文极小（通常 < 1KB），buffer 无任何性能代价
+    const body = await response.arrayBuffer();
+
     const respHeaders = new Headers(response.headers);
-    respHeaders.set('X-Proxied-By', 'CF-Worker-NextDNS');
+    // [fix] 剥离可能与 Content-Length 冲突的传输编码头，防止 HTTP 协议违规
+    respHeaders.delete('Transfer-Encoding');
+    respHeaders.delete('Content-Encoding');
+    // 强制写入精确的 Content-Length，保证严格 DNS 客户端（路由器固件等）的兼容性
+    respHeaders.set('Content-Length', body.byteLength.toString());
+    respHeaders.set('X-Proxied-By', 'NextDNS-Proxy/Cloudflare');
     respHeaders.set('Access-Control-Allow-Origin', '*');
-    return new Response(response.body, {
+    return new Response(body, {
       status:     response.status,
       statusText: response.statusText,
       headers:    respHeaders,
@@ -461,7 +483,8 @@ async function handleRequest(request, env) {
 
   // 随机选一个 NextDNS ID
   const selectedId = NEXTDNS_IDS[Math.floor(Math.random() * NEXTDNS_IDS.length)];
-  const primaryUrl = new URL(`${NEXTDNS_BASE}/${selectedId}${devicePath}`).toString();
+  // encodeURI 保留 '/' 分隔符，同时正确处理空格、中文、emoji 等设备名
+  const primaryUrl = new URL(`${NEXTDNS_BASE}/${selectedId}${encodeURI(devicePath)}`);
 
   try {
     return await withTimeout(
