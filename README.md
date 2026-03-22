@@ -137,7 +137,7 @@ Cloudflare Workers 免费套餐每天有 10 万次请求额度，个人使用完
 
 **Q：可以部署到 Cloudflare Pages 吗？**
 
-可以。将文件放在 `functions/[[path]].js`，代码无需任何修改，同一份代码同时兼容 Worker 和 Pages Functions 两种部署方式。
+可以。代码无需任何修改，同一份代码同时兼容 Worker 和 Pages Functions 两种部署方式。
 
 ## License
 
