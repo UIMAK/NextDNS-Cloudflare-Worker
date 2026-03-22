@@ -137,7 +137,7 @@ Yes. The free plan includes 100,000 requests per day, which is more than suffici
 
 **Q: Can this be deployed to Cloudflare Pages?**
 
-Yes. Place the file at `functions/[[path]].js` — no code changes are needed. The same file is compatible with both Worker and Pages Functions deployments.
+Yes. No code changes are needed. The same file is compatible with both Worker and Pages Functions deployments.
 
 ## License
 
