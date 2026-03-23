@@ -1,4 +1,4 @@
-// 环境变量配置
+// 环境变量配置 ：
 //   NEXTDNS_ID   : 你的 NextDNS 配置 ID（必填），多个用逗号分隔
 //   BASE_PATH    : 自定义路径前缀，不填默认 dns-query
 //                  注意：不要设为 "/"，否则会匹配所有路径
@@ -82,11 +82,12 @@ const safeDecodePath = (raw) => {
       prev = curr;
       curr = decodeURIComponent(curr);
     } while (curr !== prev);
-    // [fix] 同时过滤 '.' 和 '..'，防御路径遍历，不影响合法设备名（NextDNS 规范不含 '.'）
+    // [fix] 过滤所有以点开头的路径段（含 '.' '..' '...' 等），防御路径遍历
+    // NextDNS 设备名规范（a-z A-Z 0-9 -）本身不含点，此过滤不影响合法使用
     const cleaned = curr
       .replace(/^\/+/, '')
       .split('/')
-      .filter(seg => seg !== '..' && seg !== '.')
+      .filter(seg => seg !== '' && !seg.startsWith('.'))
       .join('/');
     return '/' + cleaned;
   } catch {
@@ -361,7 +362,11 @@ function isPublicIPv6(ip) {
     (b.slice(0, 15).every(x => x === 0) && b[15] === 1) || // ::1（回环）
     (b0 & 0xfe) === 0xfc ||                                // fc00::/7（ULA）
     (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||               // fe80::/10（链路本地）
-    b0 === 0xff                                            // ff00::/8（组播）
+    b0 === 0xff ||                                         // ff00::/8（组播）
+    // [fix] 补充 RFC 保留地址段，避免向这些地址注入 ECS
+    (b0 === 0x20 && b[1] === 0x01 && b[2] === 0x0d && b[3] === 0xb8) ||          // 2001:db8::/32（文档）
+    (b0 === 0x20 && b[1] === 0x01 && b[2] === 0x00 && (b[3] & 0xf0) === 0x10) || // 2001:10::/28（ORCHID）
+    (b0 === 0x20 && b[1] === 0x01 && b[2] === 0x00 && (b[3] & 0xf0) === 0x20)    // 2001:20::/28（ORCHIDv2）
   );
 }
 
@@ -387,7 +392,12 @@ async function handleRequest(request, env) {
     return errResp('Method Not Allowed', 405);
   }
 
-  const NEXTDNS_IDS        = (env.NEXTDNS_ID ?? '').split(',').map(s => s.trim()).filter(Boolean);
+  // [fix] 对每个 ID 严格清理：只保留字母、数字、连字符、下划线
+  // 防止 ID 含斜杠（如 "abc/def"）破坏上游 URL 路径层级结构
+  const NEXTDNS_IDS = (env.NEXTDNS_ID ?? '')
+    .split(',')
+    .map(s => s.trim().replace(/[^a-zA-Z0-9_-]/g, ''))
+    .filter(Boolean);
   const BASE_PATH          = env.BASE_PATH ?? '';
   const PRIMARY_TIMEOUT_MS = (() => {
     const n = parseInt(env.TIMEOUT_MS, 10);
@@ -436,8 +446,13 @@ async function handleRequest(request, env) {
       return errResp('Unsupported Media Type', 415);
     }
     const cl = request.headers.get('Content-Length');
-    if (cl && parseInt(cl, 10) > MAX_BODY) {
-      return errResp('Payload Too Large', 413);
+    // [fix] parseInt 对非数字返回 NaN，NaN > MAX_BODY 为 false 会绕过检查
+    // 改为严格校验：非整数或超限均拒绝
+    if (cl !== null) {
+      const clNum = parseInt(cl, 10);
+      if (!Number.isInteger(clNum) || clNum > MAX_BODY) {
+        return errResp('Payload Too Large', 413);
+      }
     }
     try {
       const buf = await request.arrayBuffer();
@@ -529,11 +544,21 @@ async function handleRequest(request, env) {
 }
 
 export default {
-  fetch(request, env) {
-    return handleRequest(request, env);
+  async fetch(request, env) {
+    try {
+      return await handleRequest(request, env);
+    } catch (err) {
+      console.error('Unhandled error:', err);
+      return new Response('Internal Server Error', { status: 500, headers: CORS_HEADERS });
+    }
   }
 };
 
 export async function onRequest(context) {
-  return handleRequest(context.request, context.env);
+  try {
+    return await handleRequest(context.request, context.env);
+  } catch (err) {
+    console.error('Unhandled error:', err);
+    return new Response('Internal Server Error', { status: 500, headers: CORS_HEADERS });
+  }
 }
