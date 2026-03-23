@@ -1,7 +1,4 @@
-// ================================================================
-// NextDNS Reverse Proxy - Cloudflare Worker (Modules 格式)
-// ================================================================
-// 环境变量配置（CF Dashboard -> Workers -> Settings -> Variables）：
+//   环境变量配置
 //   NEXTDNS_ID   : 你的 NextDNS 配置 ID（必填），多个用逗号分隔
 //   BASE_PATH    : 自定义路径前缀，不填默认 dns-query
 //                  注意：不要设为 "/"，否则会匹配所有路径
@@ -24,8 +21,9 @@ const CORS_HEADERS = {
   'Access-Control-Max-Age':       '86400',
 };
 
-// ── 上游请求头（固定不变，模块级复用）────────────────────────────────────────
-const UPSTREAM_HEADERS = new Headers({
+// ── 上游请求头（frozen plain object，模块级复用，防止意外修改）──────────────────
+// [fix] 由可变 Headers 实例改为 Object.freeze()，更安全；new Request() 会自动复制
+const UPSTREAM_HEADERS = Object.freeze({
   'Content-Type': 'application/dns-message',
   'Accept':       'application/dns-message',
 });
@@ -84,16 +82,24 @@ const safeDecodePath = (raw) => {
       prev = curr;
       curr = decodeURIComponent(curr);
     } while (curr !== prev);
+    // [fix] 同时过滤 '.' 和 '..'，防御路径遍历，不影响合法设备名（NextDNS 规范不含 '.'）
     const cleaned = curr
       .replace(/^\/+/, '')
       .split('/')
-      .filter(seg => seg !== '..')
+      .filter(seg => seg !== '..' && seg !== '.')
       .join('/');
     return '/' + cleaned;
   } catch {
     return ''; // 畸形编码，忽略子路径
   }
 };
+
+// ── 设备路径编码 ──────────────────────────────────────────────────────────────
+// [fix] 使用 encodeURIComponent 逐段编码，而非 encodeURI 整体编码
+// encodeURI 不编码 '#' '?' '&'，设备名含这些字符时 new URL() 会截断或污染路径
+// encodeURIComponent 将每段完整编码，'/' 由 join('/') 自然重建，不会被误编码
+const encodeDevicePath = (devicePath) =>
+  devicePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
 
 // ═════════════════════════════════════════════════════════════════════════════
 // DNS 报文层 ECS 注入
@@ -116,7 +122,7 @@ function readU16(buf, off) {
 
 function writeU16BE(value) { return new Uint8Array([value >> 8, value & 0xff]); }
 
-// [fix] 增加跳转计数器上限，防止标签扫描失控；压缩指针增加 o+1 边界检查
+// 增加跳转计数器上限，防止标签扫描失控；压缩指针增加 o+1 边界检查
 function skipName(buf, off) {
   let o = off;
   let steps = 0;
@@ -134,10 +140,12 @@ function skipName(buf, off) {
   return o;
 }
 
-// 入口边界检查
+// [fix] 增加 QTYPE/QCLASS 4 字节的显式边界检查，防止截断报文越界
 function skipQuestion(buf, off) {
   if (off >= buf.length) throw new RangeError('Question truncated');
-  return skipName(buf, off) + 4;
+  const endName = skipName(buf, off);
+  if (endName + 4 > buf.length) throw new RangeError('Question QTYPE/QCLASS truncated');
+  return endName + 4;
 }
 
 // 入口 + 出口双重边界检查
@@ -230,7 +238,7 @@ function injectECS(buf, clientIp) {
   }
 
   // 没有 OPT record，新建一个并追加
-  const arCount = readU16(buf, 10);
+  // [fix] 直接使用 findSections 已解构的 ar，消除冗余的 readU16(buf, 10) 重复读取
   const optRecord = concatUint8(
     new Uint8Array([0x00]),       // root name
     writeU16BE(41),               // TYPE = OPT
@@ -240,7 +248,7 @@ function injectECS(buf, clientIp) {
     ecsOpt
   );
   const newBuf = concatUint8(buf, optRecord);
-  const ar2 = arCount + 1;
+  const ar2 = ar + 1;
   newBuf[10] = (ar2 >> 8) & 0xff;
   newBuf[11] = ar2 & 0xff;
   return newBuf;
@@ -261,6 +269,11 @@ function parseIPv4(str) {
   return out;
 }
 
+// [fix] 增加每段严格格式校验（1-4位十六进制），防止 parseInt 对非法字符的截断解析
+// 例：parseInt('fghi', 16) = 15（不返回 NaN），会导致 ECS 写入错误地址
+// 同时将 isNaN 改为 Number.isNaN，避免隐式类型转换导致的误判
+const HEX_GROUP = /^[0-9a-fA-F]{1,4}$/;
+
 function parseIPv6(str) {
   let main = str, v4bytes = null;
   const lastColon = str.lastIndexOf(':'), lastDot = str.lastIndexOf('.');
@@ -273,9 +286,12 @@ function parseIPv6(str) {
   if (parts.length > 2) return null;
   const left  = parts[0] ? parts[0].split(':').filter(Boolean) : [];
   const right = parts[1] ? parts[1].split(':').filter(Boolean) : [];
+  // [fix] 严格校验：每段必须是 1-4 位十六进制，拒绝非法字符或超长段
+  if (left.some(h => !HEX_GROUP.test(h)) || right.some(h => !HEX_GROUP.test(h))) return null;
   const leftVals  = left.map(h => parseInt(h, 16));
   const rightVals = right.map(h => parseInt(h, 16));
-  if (leftVals.some(isNaN) || rightVals.some(isNaN)) return null;
+  // [fix] Number.isNaN 替代 isNaN，避免隐式类型转换（经过上方 HEX_GROUP 校验后此行为兜底）
+  if (leftVals.some(Number.isNaN) || rightVals.some(Number.isNaN)) return null;
   // v4bytes 已占 2 个 word，missing 计算已预留，无需额外 pop()
   const missing = 8 - (leftVals.length + rightVals.length + (v4bytes ? 2 : 0));
   if (missing < 0) return null;
@@ -483,8 +499,9 @@ async function handleRequest(request, env) {
 
   // 随机选一个 NextDNS ID
   const selectedId = NEXTDNS_IDS[Math.floor(Math.random() * NEXTDNS_IDS.length)];
-  // encodeURI 保留 '/' 分隔符，同时正确处理空格、中文、emoji 等设备名
-  const primaryUrl = new URL(`${NEXTDNS_BASE}/${selectedId}${encodeURI(devicePath)}`);
+  // [fix] 使用 encodeDevicePath（encodeURIComponent 逐段编码）替代 encodeURI 整体编码
+  // encodeURI 不编码 '#' '?' '&'，设备名含这些字符时 new URL() 会截断或污染路径
+  const primaryUrl = new URL(`${NEXTDNS_BASE}/${selectedId}${encodeDevicePath(devicePath)}`);
 
   try {
     return await withTimeout(
