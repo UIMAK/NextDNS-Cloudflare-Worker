@@ -342,7 +342,8 @@ function isPublicIPv4(ip) {
 function isPublicIPv6(ip) {
   const b = parseIPv6(ip);
   if (!b) return false;
-  const b0 = b[0], b1 = b[1];
+  // [opt] 解构前 4 字节，与后续 b[n] 访问风格统一，提升可读性
+  const [b0, b1, b2, b3] = b;
 
   // 补充 IPv4-mapped (::ffff:0:0/96) 和 NAT64 (64:ff9b::/96) 地址段
   // 这两类地址的公网性取决于内嵌的 IPv4 地址，提取后委托 isPublicIPv4 判断
@@ -364,9 +365,9 @@ function isPublicIPv6(ip) {
     (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||               // fe80::/10（链路本地）
     b0 === 0xff ||                                         // ff00::/8（组播）
     // [fix] 补充 RFC 保留地址段，避免向这些地址注入 ECS
-    (b0 === 0x20 && b[1] === 0x01 && b[2] === 0x0d && b[3] === 0xb8) ||          // 2001:db8::/32（文档）
-    (b0 === 0x20 && b[1] === 0x01 && b[2] === 0x00 && (b[3] & 0xf0) === 0x10) || // 2001:10::/28（ORCHID）
-    (b0 === 0x20 && b[1] === 0x01 && b[2] === 0x00 && (b[3] & 0xf0) === 0x20)    // 2001:20::/28（ORCHIDv2）
+    (b0 === 0x20 && b1 === 0x01 && b2 === 0x0d && b3 === 0xb8) ||          // 2001:db8::/32（文档）
+    (b0 === 0x20 && b1 === 0x01 && b2 === 0x00 && (b3 & 0xf0) === 0x10) || // 2001:10::/28（ORCHID）
+    (b0 === 0x20 && b1 === 0x01 && b2 === 0x00 && (b3 & 0xf0) === 0x20)    // 2001:20::/28（ORCHIDv2）
   );
 }
 
@@ -450,7 +451,8 @@ async function handleRequest(request, env) {
     // 改为严格校验：非整数或超限均拒绝
     if (cl !== null) {
       const clNum = parseInt(cl, 10);
-      if (!Number.isInteger(clNum) || clNum > MAX_BODY) {
+      // [fix] 同时拒绝负值：Content-Length: -1 会绕过 clNum > MAX_BODY 检查
+      if (!Number.isInteger(clNum) || clNum < 0 || clNum > MAX_BODY) {
         return errResp('Payload Too Large', 413);
       }
     }
@@ -548,7 +550,7 @@ export default {
     try {
       return await handleRequest(request, env);
     } catch (err) {
-      console.error('Unhandled error:', err);
+      console.error(`Unhandled error: ${err.name}: ${err.message}`);
       return new Response('Internal Server Error', { status: 500, headers: CORS_HEADERS });
     }
   }
@@ -558,7 +560,7 @@ export async function onRequest(context) {
   try {
     return await handleRequest(context.request, context.env);
   } catch (err) {
-    console.error('Unhandled error:', err);
+    console.error(`Unhandled error: ${err.name}: ${err.message}`);
     return new Response('Internal Server Error', { status: 500, headers: CORS_HEADERS });
   }
 }
