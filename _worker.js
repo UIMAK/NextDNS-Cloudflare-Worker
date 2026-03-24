@@ -1,10 +1,9 @@
-// 环境变量配置 ：
+	// 环境变量配置 ：
 	//   NEXTDNS_ID   : 你的 NextDNS 配置 ID（必填），多个用逗号分隔
 	//   BASE_PATH    : 自定义路径前缀，不填默认 dns-query
 	//   FALLBACK_URL : 备用 DoH，不填默认 https://dns.google/dns-query
 	//   TIMEOUT_MS   : 主上游超时时间（毫秒），不填默认 2500
 	// ================================================================
-	 
 	const NEXTDNS_BASE        = 'https://dns.nextdns.io';
 	const DEFAULT_FALLBACK    = 'https://dns.google/dns-query';
 	const MAX_BODY            = 64 * 1024;
@@ -12,27 +11,22 @@
 	const FALLBACK_TIMEOUT_MS = 1500;
 	const ECS_V4_PREFIX       = 24;
 	const ECS_V6_PREFIX       = 48;
-	 
 	const CORS_HEADERS = {
 	  'Access-Control-Allow-Origin':  '*',
 	  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 	  'Access-Control-Allow-Headers': 'Content-Type, Accept',
 	  'Access-Control-Max-Age':       '86400',
 	};
-	 
 	const UPSTREAM_HEADERS = Object.freeze({
 	  'Content-Type': 'application/dns-message',
 	  'Accept':       'application/dns-message',
 	});
-	 
 	const CDN_IP_HEADERS = [
 	  'EO-Client-IP', 'ali-real-client-ip', 'CF-Connecting-IP',
 	  'X-Forwarded-For', 'X-Real-IP',
 	];
-	 
 	const errResp = (body, status) =>
 	  new Response(body, { status, headers: CORS_HEADERS });
-	 
 	let _config = null;
 	function getConfig(env) {
 	  if (_config) return _config;
@@ -51,7 +45,6 @@
 	  _config = { NEXTDNS_IDS, PRIMARY_TIMEOUT_MS, fallbackBase, basePath };
 	  return _config;
 	}
-	 
 	const withTimeout = async (fetchFn, ms) => {
 	  const controller = new AbortController();
 	  const timer = setTimeout(() => controller.abort(), ms);
@@ -68,7 +61,6 @@
 	    clearTimeout(timer);
 	  }
 	};
-	 
 	const getClientIP = (headers) => {
 	  for (const name of CDN_IP_HEADERS) {
 	    const val = headers.get(name);
@@ -78,7 +70,6 @@
 	  }
 	  return null;
 	};
-	 
 	const safeDecodePath = (raw) => {
 	  if (!raw || raw === '/') return '';
 	  try {
@@ -97,10 +88,8 @@
 	    return '';
 	  }
 	};
-	 
 	const encodeDevicePath = (devicePath) =>
 	  devicePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
-	 
 	function base64urlDecode(s) {
 	  if (s.length % 4 === 1) throw new Error('Invalid base64url length');
 	  if (!/^[A-Za-z0-9_-]+$/.test(s)) throw new Error('Invalid base64url characters');
@@ -109,14 +98,11 @@
 	  const bin = atob(b64);
 	  return Uint8Array.from(bin, c => c.charCodeAt(0));
 	}
-	 
 	function readU16(buf, off) {
 	  if (off + 1 >= buf.length) throw new RangeError('readU16 out of bounds');
 	  return (buf[off] << 8) | buf[off + 1];
 	}
-	 
 	function writeU16BE(value) { return new Uint8Array([value >> 8, value & 0xff]); }
-	 
 	function skipName(buf, off) {
 	  let o = off;
 	  let steps = 0;
@@ -132,21 +118,18 @@
 	  }
 	  return o;
 	}
-	 
 	function skipQuestion(buf, off) {
 	  if (off >= buf.length) throw new RangeError('Question truncated');
 	  const endName = skipName(buf, off);
 	  if (endName + 4 > buf.length) throw new RangeError('Question QTYPE/QCLASS truncated');
 	  return endName + 4;
 	}
-	 
 	function skipRR(buf, off) {
 	  if (off >= buf.length) throw new RangeError('RR truncated');
 	  const endName = skipName(buf, off);
 	  if (endName + 10 > buf.length) throw new RangeError('RR header truncated');
 	  return endName + 10 + readU16(buf, endName + 8);
 	}
-	 
 	function findSections(buf) {
 	  if (buf.length < 12) throw new RangeError('DNS message too short');
 	  const qd = readU16(buf, 4), an = readU16(buf, 6),
@@ -157,7 +140,6 @@
 	  for (let i = 0; i < ns; i++) off = skipRR(buf, off);
 	  return { ar, additionalStart: off };
 	}
-	 
 	function parseAdditionalRecords(buf, arStart, arCount) {
 	  const recs = []; let off = arStart;
 	  for (let i = 0; i < arCount; i++) {
@@ -174,7 +156,6 @@
 	  }
 	  return recs;
 	}
-	 
 	function concatUint8(...arrays) {
 	  let len = 0;
 	  for (const a of arrays) len += a.length;
@@ -182,7 +163,6 @@
 	  for (const a of arrays) { out.set(a, off); off += a.length; }
 	  return out;
 	}
-	 
 	function buildEcsOption(ipBytes, family, prefixLen) {
 	  const count = Math.ceil(prefixLen / 8);
 	  const trimmed = new Uint8Array(count);
@@ -193,7 +173,6 @@
 	    new Uint8Array([prefixLen & 0xff, 0]), trimmed);
 	  return concatUint8(writeU16BE(8), writeU16BE(optData.length), optData);
 	}
-	 
 	function injectECS(buf, clientIp) {
 	  const ip = parseIp(clientIp);
 	  if (!ip) return buf;
@@ -202,7 +181,6 @@
 	  const { ar, additionalStart } = findSections(buf);
 	  const addRecs = parseAdditionalRecords(buf, additionalStart, ar);
 	  const optIdx = addRecs.findIndex(r => r.type === 41);
-	 
 	  if (optIdx !== -1) {
 	    const rec = addRecs[optIdx];
 	    const options = [];
@@ -222,7 +200,6 @@
 	      buf.slice(rec.rdataEnd)
 	    );
 	  }
-	 
 	  const optRecord = concatUint8(
 	    new Uint8Array([0x00]), writeU16BE(41), writeU16BE(4096),
 	    new Uint8Array([0, 0, 0, 0]), writeU16BE(ecsOpt.length), ecsOpt
@@ -233,7 +210,6 @@
 	  newBuf[11] = ar2 & 0xff;
 	  return newBuf;
 	}
-	 
 	function parseIPv4(str) {
 	  const parts = str.split('.');
 	  if (parts.length !== 4) return null;
@@ -246,9 +222,7 @@
 	  }
 	  return out;
 	}
-	 
 	const HEX_GROUP = /^[0-9a-fA-F]{1,4}$/;
-	 
 	function parseIPv6(str) {
 	  let main = str, v4bytes = null;
 	  const lastColon = str.lastIndexOf(':'), lastDot = str.lastIndexOf('.');
@@ -280,7 +254,6 @@
 	  }
 	  return out;
 	}
-	 
 	function parseIp(str) {
 	  if (!str) return null;
 	  if (str.includes(':')) {
@@ -290,12 +263,10 @@
 	  const bytes = parseIPv4(str);
 	  return bytes ? { family: 1, bytes } : null;
 	}
-	 
 	function allZero(buf, start, end) {
 	  for (let i = start; i < end; i++) if (buf[i] !== 0) return false;
 	  return true;
 	}
-	 
 	function isPublicIPv4(ip) {
 	  const b = parseIPv4(ip);
 	  if (!b) return false;
@@ -308,7 +279,6 @@
 	    inRange(0x00000000, 0xff000000) || (b[0] & 0xf0) === 0xe0 || (b[0] & 0xf0) === 0xf0
 	  );
 	}
-	 
 	function isPublicIPv6(ip) {
 	  const b = parseIPv6(ip);
 	  if (!b) return false;
@@ -317,12 +287,10 @@
 	  const isNAT64 = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && allZero(b, 4, 12);
 	  const isLocalNAT64 = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && b[4] === 0x00 && b[5] === 0x01;
 	  const is6to4 = b0 === 0x20 && b1 === 0x02;
-	 
 	  if (isV4Mapped || isNAT64 || isLocalNAT64 || is6to4) {
 	    const v4 = is6to4 ? `${b[2]}.${b[3]}.${b[4]}.${b[5]}` : `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
 	    return isPublicIPv4(v4);
 	  }
-	 
 	  return !(
 	    allZero(b, 0, 16) || (allZero(b, 0, 15) && b[15] === 1) ||
 	    (b0 & 0xfe) === 0xfc || (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||
@@ -331,38 +299,29 @@
 	    (b0 === 0x20 && b1 === 0x01 && b2 === 0x00 && (b3 & 0xf0) === 0x20)
 	  );
 	}
-	 
 	function isPublicIp(ip) {
 	  if (!ip) return false;
 	  return ip.includes(':') ? isPublicIPv6(ip) : isPublicIPv4(ip);
 	}
-	 
 	async function handleRequest(request, env) {
 	  const clientUrl = new URL(request.url);
-	 
 	  if (request.method === 'OPTIONS') {
 	    return new Response(null, { status: 204, headers: CORS_HEADERS });
 	  }
-	 
 	  if (!['GET', 'POST'].includes(request.method)) {
 	    return errResp('Method Not Allowed', 405);
 	  }
-	 
 	  const { NEXTDNS_IDS, PRIMARY_TIMEOUT_MS, fallbackBase, basePath } = getConfig(env);
-	 
 	  if (
 	    clientUrl.pathname !== basePath &&
 	    !clientUrl.pathname.startsWith(basePath + '/')
 	  ) {
 	    return errResp('Not Found', 404);
 	  }
-	 
 	  if (NEXTDNS_IDS.length === 0) {
 	    return errResp('Server misconfiguration: NEXTDNS_ID not set', 500);
 	  }
-	 
 	  const clientIP = getClientIP(request.headers);
-	 
 	  let dnsWire;
 	  if (request.method === 'GET') {
 	    const dnsParam = clientUrl.searchParams.get('dns');
@@ -392,9 +351,7 @@
 	      return errResp('Failed to read request body', 400);
 	    }
 	  }
-	 
 	  if (dnsWire.length < 12) return errResp('Invalid DNS message', 400);
-	 
 	  let mutatedWire = dnsWire;
 	  if (isPublicIp(clientIP)) {
 	    try {
@@ -403,9 +360,7 @@
 	      mutatedWire = dnsWire;
 	    }
 	  }
-	 
 	  const devicePath = safeDecodePath(clientUrl.pathname.substring(basePath.length));
-	 
 	  const tryFetch = async (upstreamUrl, signal) => {
 	    const req = new Request(upstreamUrl, {
 	      method: 'POST', headers: UPSTREAM_HEADERS,
@@ -430,19 +385,21 @@
 	      headers: respHeaders,
 	    });
 	  };
-	 
 	  const selectedId = NEXTDNS_IDS[Math.floor(Math.random() * NEXTDNS_IDS.length)];
 	  const primaryUrl = new URL(`${NEXTDNS_BASE}/${selectedId}${encodeDevicePath(devicePath)}`);
-	 
 	  try {
 	    return await withTimeout((signal) => tryFetch(primaryUrl, signal), PRIMARY_TIMEOUT_MS);
 	  } catch (primaryErr) {
 	    try {
 	      const resp = await withTimeout((signal) => tryFetch(fallbackBase, signal), FALLBACK_TIMEOUT_MS);
+	      const body = await resp.arrayBuffer();
 	      const respHeaders = new Headers(resp.headers);
+	      respHeaders.delete('Transfer-Encoding');
+	      respHeaders.delete('Content-Encoding');
+	      respHeaders.set('Content-Length', body.byteLength.toString());
 	      respHeaders.set('X-Fallback', primaryErr.name === 'TimeoutError' ? 'primary-timeout' : 'primary-error');
 	      respHeaders.set('Access-Control-Allow-Origin', '*');
-	      return new Response(resp.body, {
+	      return new Response(body, {
 	        status: resp.status,
 	        statusText: resp.statusText,
 	        headers: respHeaders,
@@ -452,7 +409,6 @@
 	    }
 	  }
 	}
-	 
 	export default {
 	  async fetch(request, env) {
 	    try {
@@ -463,7 +419,6 @@
 	    }
 	  }
 	};
-	 
 	export async function onRequest(context) {
 	  try {
 	    return await handleRequest(context.request, context.env);
