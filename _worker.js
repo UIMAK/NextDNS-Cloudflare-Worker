@@ -22,7 +22,6 @@ const CORS_HEADERS = {
 };
 
 // ── 上游请求头（frozen plain object，模块级复用，防止意外修改）──────────────────
-// [fix] 由可变 Headers 实例改为 Object.freeze()，更安全；new Request() 会自动复制
 const UPSTREAM_HEADERS = Object.freeze({
   'Content-Type': 'application/dns-message',
   'Accept':       'application/dns-message',
@@ -41,6 +40,30 @@ const CDN_IP_HEADERS = [
 // ── 统一错误响应（携带 CORS 头，避免浏览器端 CORS 拦截错误信息）──────────────
 const errResp = (body, status) =>
   new Response(body, { status, headers: CORS_HEADERS });
+
+// ── [opt] 模块级配置缓存 ──────────────────────────────────────────────────────
+// CF Workers 的 env 在同一 isolate 生命周期内稳定，首次请求时解析并缓存，
+// 后续请求直接复用，避免每次重复解析字符串和构造 URL。
+// 重新部署时 isolate 会被替换，_config 随之重置，不会读到旧配置。
+let _config = null;
+function getConfig(env) {
+  if (_config) return _config;
+  const NEXTDNS_IDS = (env.NEXTDNS_ID ?? '')
+    .split(',')
+    .map(s => s.trim().replace(/[^a-zA-Z0-9_-]/g, ''))
+    .filter(Boolean);
+  const PRIMARY_TIMEOUT_MS = (() => {
+    const n = parseInt(env.TIMEOUT_MS, 10);
+    return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
+  })();
+  let fallbackBase = DEFAULT_FALLBACK;
+  try { fallbackBase = new URL(env.FALLBACK_URL || DEFAULT_FALLBACK).toString(); } catch {}
+  // 过滤掉纯斜杠配置（BASE_PATH='/' 会匹配所有路径，是常见配置失误）
+  const normalizedBase = (env.BASE_PATH ?? '').replace(/^\/+|\/+$/g, '');
+  const basePath = normalizedBase ? `/${normalizedBase}` : '/dns-query';
+  _config = { NEXTDNS_IDS, PRIMARY_TIMEOUT_MS, fallbackBase, basePath };
+  return _config;
+}
 
 // ── withTimeout ───────────────────────────────────────────────────────────────
 const withTimeout = async (fetchFn, ms) => {
@@ -82,23 +105,23 @@ const safeDecodePath = (raw) => {
       prev = curr;
       curr = decodeURIComponent(curr);
     } while (curr !== prev);
-    // [fix] 过滤所有以点开头的路径段（含 '.' '..' '...' 等），防御路径遍历
-    // NextDNS 设备名规范（a-z A-Z 0-9 -）本身不含点，此过滤不影响合法使用
+    // 过滤所有以点开头的路径段（含 '.' '..' '...' 等），防御路径遍历
     const cleaned = curr
       .replace(/^\/+/, '')
       .split('/')
       .filter(seg => seg !== '' && !seg.startsWith('.'))
       .join('/');
-    return '/' + cleaned;
+    // [fix] cleaned='' 时返回 '' 而非 '/'，与 raw='/' 时的行为完全一致，
+    // 避免 /.. 类输入生成尾部斜杠污染上游 URL
+    return cleaned ? '/' + cleaned : '';
   } catch {
     return ''; // 畸形编码，忽略子路径
   }
 };
 
 // ── 设备路径编码 ──────────────────────────────────────────────────────────────
-// [fix] 使用 encodeURIComponent 逐段编码，而非 encodeURI 整体编码
+// 使用 encodeURIComponent 逐段编码，而非 encodeURI 整体编码
 // encodeURI 不编码 '#' '?' '&'，设备名含这些字符时 new URL() 会截断或污染路径
-// encodeURIComponent 将每段完整编码，'/' 由 join('/') 自然重建，不会被误编码
 const encodeDevicePath = (devicePath) =>
   devicePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
 
@@ -141,7 +164,7 @@ function skipName(buf, off) {
   return o;
 }
 
-// [fix] 增加 QTYPE/QCLASS 4 字节的显式边界检查，防止截断报文越界
+// 增加 QTYPE/QCLASS 4 字节的显式边界检查，防止截断报文越界
 function skipQuestion(buf, off) {
   if (off >= buf.length) throw new RangeError('Question truncated');
   const endName = skipName(buf, off);
@@ -239,7 +262,6 @@ function injectECS(buf, clientIp) {
   }
 
   // 没有 OPT record，新建一个并追加
-  // [fix] 直接使用 findSections 已解构的 ar，消除冗余的 readU16(buf, 10) 重复读取
   const optRecord = concatUint8(
     new Uint8Array([0x00]),       // root name
     writeU16BE(41),               // TYPE = OPT
@@ -270,9 +292,8 @@ function parseIPv4(str) {
   return out;
 }
 
-// [fix] 增加每段严格格式校验（1-4位十六进制），防止 parseInt 对非法字符的截断解析
+// 增加每段严格格式校验（1-4位十六进制），防止 parseInt 对非法字符的截断解析
 // 例：parseInt('fghi', 16) = 15（不返回 NaN），会导致 ECS 写入错误地址
-// 同时将 isNaN 改为 Number.isNaN，避免隐式类型转换导致的误判
 const HEX_GROUP = /^[0-9a-fA-F]{1,4}$/;
 
 function parseIPv6(str) {
@@ -287,13 +308,12 @@ function parseIPv6(str) {
   if (parts.length > 2) return null;
   const left  = parts[0] ? parts[0].split(':').filter(Boolean) : [];
   const right = parts[1] ? parts[1].split(':').filter(Boolean) : [];
-  // [fix] 严格校验：每段必须是 1-4 位十六进制，拒绝非法字符或超长段
+  // 严格校验：每段必须是 1-4 位十六进制，拒绝非法字符或超长段
   if (left.some(h => !HEX_GROUP.test(h)) || right.some(h => !HEX_GROUP.test(h))) return null;
   const leftVals  = left.map(h => parseInt(h, 16));
   const rightVals = right.map(h => parseInt(h, 16));
-  // [fix] Number.isNaN 替代 isNaN，避免隐式类型转换（经过上方 HEX_GROUP 校验后此行为兜底）
+  // Number.isNaN 替代 isNaN，避免隐式类型转换（经过上方 HEX_GROUP 校验后此行为兜底）
   if (leftVals.some(Number.isNaN) || rightVals.some(Number.isNaN)) return null;
-  // v4bytes 已占 2 个 word，missing 计算已预留，无需额外 pop()
   const missing = 8 - (leftVals.length + rightVals.length + (v4bytes ? 2 : 0));
   if (missing < 0) return null;
   const words = [...leftVals, ...Array(missing).fill(0), ...rightVals];
@@ -320,6 +340,12 @@ function parseIp(str) {
   return bytes ? { family: 1, bytes } : null;
 }
 
+// [opt] 零分配区间全零判断，替代 buf.slice(s,e).every()，避免创建临时数组
+function allZero(buf, start, end) {
+  for (let i = start; i < end; i++) if (buf[i] !== 0) return false;
+  return true;
+}
+
 function isPublicIPv4(ip) {
   const b = parseIPv4(ip);
   if (!b) return false;
@@ -342,30 +368,34 @@ function isPublicIPv4(ip) {
 function isPublicIPv6(ip) {
   const b = parseIPv6(ip);
   if (!b) return false;
-  // [opt] 解构前 4 字节，与后续 b[n] 访问风格统一，提升可读性
+  // [fix] 统一使用解构变量，不再混用 b[n] 下标访问
   const [b0, b1, b2, b3] = b;
 
-  // 补充 IPv4-mapped (::ffff:0:0/96) 和 NAT64 (64:ff9b::/96) 地址段
-  // 这两类地址的公网性取决于内嵌的 IPv4 地址，提取后委托 isPublicIPv4 判断
-  const isV4Mapped =
-    b.slice(0, 10).every(x => x === 0) && b[10] === 0xff && b[11] === 0xff;
-  const isNAT64 =
-    b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b &&
-    b.slice(4, 12).every(x => x === 0);
+  // ── 内嵌 IPv4 地址族：公网性委托给 isPublicIPv4 判断 ──────────────────────
+  // IPv4-mapped (::ffff:0:0/96) — 内嵌 IPv4 在 bytes 12-15
+  const isV4Mapped = allZero(b, 0, 10) && b[10] === 0xff && b[11] === 0xff;
+  // 公共 NAT64 (64:ff9b::/96) — RFC 6052，内嵌 IPv4 在 bytes 12-15
+  const isNAT64 = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && allZero(b, 4, 12);
+  // [fix] 本地用 NAT64 (64:ff9b:1::/48) — RFC 8215，内嵌 IPv4 同样在 bytes 12-15
+  const isLocalNAT64 = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b &&
+                       b[4] === 0x00 && b[5] === 0x01;
+  // [fix] 6to4 (2002::/16) — RFC 3056，内嵌 IPv4 在 bytes 2-5
+  const is6to4 = b0 === 0x20 && b1 === 0x02;
 
-  if (isV4Mapped || isNAT64) {
-    const v4 = `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
+  if (isV4Mapped || isNAT64 || isLocalNAT64 || is6to4) {
+    const v4 = is6to4
+      ? `${b[2]}.${b[3]}.${b[4]}.${b[5]}`   // 6to4 内嵌位置不同
+      : `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
     return isPublicIPv4(v4);
   }
 
   return !(
-    b.every(x => x === 0) ||                               // ::（未指定）
-    (b.slice(0, 15).every(x => x === 0) && b[15] === 1) || // ::1（回环）
-    (b0 & 0xfe) === 0xfc ||                                // fc00::/7（ULA）
+    allZero(b, 0, 16) ||                                    // ::（未指定）
+    (allZero(b, 0, 15) && b[15] === 1) ||                   // ::1（回环）
+    (b0 & 0xfe) === 0xfc ||                                 // fc00::/7（ULA）
     (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||               // fe80::/10（链路本地）
-    b0 === 0xff ||                                         // ff00::/8（组播）
-    // [fix] 补充 RFC 保留地址段，避免向这些地址注入 ECS
-    (b0 === 0x20 && b1 === 0x01 && b2 === 0x0d && b3 === 0xb8) ||          // 2001:db8::/32（文档）
+    b0 === 0xff ||                                          // ff00::/8（组播）
+    (b0 === 0x20 && b1 === 0x01 && b2 === 0x0d && b3 === 0xb8) ||           // 2001:db8::/32（文档）
     (b0 === 0x20 && b1 === 0x01 && b2 === 0x00 && (b3 & 0xf0) === 0x10) || // 2001:10::/28（ORCHID）
     (b0 === 0x20 && b1 === 0x01 && b2 === 0x00 && (b3 & 0xf0) === 0x20)    // 2001:20::/28（ORCHIDv2）
   );
@@ -393,21 +423,8 @@ async function handleRequest(request, env) {
     return errResp('Method Not Allowed', 405);
   }
 
-  // [fix] 对每个 ID 严格清理：只保留字母、数字、连字符、下划线
-  // 防止 ID 含斜杠（如 "abc/def"）破坏上游 URL 路径层级结构
-  const NEXTDNS_IDS = (env.NEXTDNS_ID ?? '')
-    .split(',')
-    .map(s => s.trim().replace(/[^a-zA-Z0-9_-]/g, ''))
-    .filter(Boolean);
-  const BASE_PATH          = env.BASE_PATH ?? '';
-  const PRIMARY_TIMEOUT_MS = (() => {
-    const n = parseInt(env.TIMEOUT_MS, 10);
-    return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
-  })();
-
-  // 过滤掉纯斜杠配置（BASE_PATH='/' 会匹配所有路径，是常见配置失误）
-  const normalizedBase = BASE_PATH.replace(/^\/+|\/+$/g, '');
-  const basePath = normalizedBase ? `/${normalizedBase}` : '/dns-query';
+  // [opt] 从缓存获取已解析的配置，避免每次请求重复解析
+  const { NEXTDNS_IDS, PRIMARY_TIMEOUT_MS, fallbackBase, basePath } = getConfig(env);
 
   if (
     clientUrl.pathname !== basePath &&
@@ -418,13 +435,6 @@ async function handleRequest(request, env) {
 
   if (NEXTDNS_IDS.length === 0) {
     return errResp('Server misconfiguration: NEXTDNS_ID not set', 500);
-  }
-
-  let fallbackBase;
-  try {
-    fallbackBase = new URL(env.FALLBACK_URL || DEFAULT_FALLBACK).toString();
-  } catch {
-    fallbackBase = DEFAULT_FALLBACK;
   }
 
   // 获取真实客户端 IP
@@ -447,11 +457,10 @@ async function handleRequest(request, env) {
       return errResp('Unsupported Media Type', 415);
     }
     const cl = request.headers.get('Content-Length');
-    // [fix] parseInt 对非数字返回 NaN，NaN > MAX_BODY 为 false 会绕过检查
-    // 改为严格校验：非整数或超限均拒绝
+    // parseInt 对非数字返回 NaN，NaN > MAX_BODY 为 false 会绕过检查；
+    // 同时拒绝负值：Content-Length: -1 会绕过 clNum > MAX_BODY 检查
     if (cl !== null) {
       const clNum = parseInt(cl, 10);
-      // [fix] 同时拒绝负值：Content-Length: -1 会绕过 clNum > MAX_BODY 检查
       if (!Number.isInteger(clNum) || clNum < 0 || clNum > MAX_BODY) {
         return errResp('Payload Too Large', 413);
       }
@@ -500,7 +509,7 @@ async function handleRequest(request, env) {
     const body = await response.arrayBuffer();
 
     const respHeaders = new Headers(response.headers);
-    // [fix] 剥离可能与 Content-Length 冲突的传输编码头，防止 HTTP 协议违规
+    // 剥离可能与 Content-Length 冲突的传输编码头，防止 HTTP 协议违规
     respHeaders.delete('Transfer-Encoding');
     respHeaders.delete('Content-Encoding');
     // 强制写入精确的 Content-Length，保证严格 DNS 客户端（路由器固件等）的兼容性
@@ -516,8 +525,6 @@ async function handleRequest(request, env) {
 
   // 随机选一个 NextDNS ID
   const selectedId = NEXTDNS_IDS[Math.floor(Math.random() * NEXTDNS_IDS.length)];
-  // [fix] 使用 encodeDevicePath（encodeURIComponent 逐段编码）替代 encodeURI 整体编码
-  // encodeURI 不编码 '#' '?' '&'，设备名含这些字符时 new URL() 会截断或污染路径
   const primaryUrl = new URL(`${NEXTDNS_BASE}/${selectedId}${encodeDevicePath(devicePath)}`);
 
   try {
