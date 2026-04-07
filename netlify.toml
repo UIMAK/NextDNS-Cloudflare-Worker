@@ -1,0 +1,19 @@
+[build]
+  # 纯 Edge Function 项目，无需构建产物；如有静态文件改为实际目录
+  publish        = "public"
+  edge_functions = "netlify/edge-functions"
+
+# 无设备 ID：/uimak
+[[edge_functions]]
+  path     = "/uimak"
+  function = "uimak"
+
+# 带设备 ID（单段）：/uimak/my-iphone
+[[edge_functions]]
+  path     = "/uimak/*"
+  function = "uimak"
+
+# 带设备 ID（多级子路径）：/uimak/foo/bar
+[[edge_functions]]
+  path     = "/uimak/**"
+  function = "uimak"

@@ -1,146 +1,216 @@
-# NextDNS Cloudflare Worker 反代
+# NextDNS DoH Proxy - 统一单文件版本
 
-**[English](https://github.com/QSDR2s1d/NextDNS-Cloudflare-Worker/blob/main/README.en.md) | 中文**
+## 核心特性
 
-一个基于 Cloudflare Worker 的 NextDNS DoH 反向代理，支持自定义路径、备用上游、DNS 报文级 ECS 注入和超时自动切换。
+**一个文件，三个平台** - `universal.js` 自动检测运行环境，无需手动配置
 
-## 功能特性
+### 平台自动检测
 
-- 🔒 **隐藏路径鉴权**：自定义 DoH 路径，不知道路径的请求直接 404
-- 🌍 **DNS 报文级 ECS 注入**：直接在 DNS 二进制报文中注入 EDNS Client Subnet，符合 RFC 7871 标准，对所有支持 ECS 的上游均有效
-- 🔄 **自动 Fallback**：主上游超时或报错时自动切换备用 DoH
-- ⚖️ **多账户负载均衡**：支持配置多个 NextDNS ID，随机分摊请求额度
-- ⏱️ **超时控制**：使用 `AbortController` 真正中止超时请求，避免资源浪费
-- ⚙️ **全环境变量配置**：无需修改代码，所有参数通过环境变量控制
-- 🌐 **CORS 支持**：支持浏览器直接调用，兼容网页端 DoH 测试工具
+```javascript
+// 检测逻辑：
+// - 有 Deno.env → Netlify Edge Functions
+// - 有 process.env → Vercel Edge Functions
+// - 默认 → Cloudflare Workers/Pages
+```
 
-## 部署
+## 环境变量配置
 
-### 1. 创建 Worker
+### 通用配置（所有平台）
 
-登录 [Cloudflare Dashboard](https://dash.cloudflare.com)，进入 **Workers & Pages → Create application → Create Worker**，将 `worker.js` 的内容粘贴进去，保存并部署。
-
-### 2. 配置环境变量
-
-进入 Worker 的 **Settings → Variables**，添加以下环境变量：
-
-| 变量 | 必填 | 默认值 | 说明 |
+| 变量 | 说明 | 默认值 | 必填 |
 |------|------|--------|------|
-| `NEXTDNS_ID` | ✅ | 无 | 你的 NextDNS 配置 ID，多个 ID 用逗号分隔，如 `a1b2c3,d4e5f6` |
-| `BASE_PATH` | — | `dns-query` | 自定义路径，用于隐藏你的 DoH 端点，填写 `mysecretpath` 则访问路径为 `/mysecretpath` |
-| `FALLBACK_URL` | — | `https://dns.google/dns-query` | 主上游不可用时的备用 DoH 地址 |
-| `TIMEOUT_MS` | — | `2500` | 主上游超时时间（毫秒），超时后自动切换备用 |
+| `NEXTDNS_ID` | NextDNS 配置 ID，多个用逗号分隔 | - | ✅ |
+| `FALLBACK_URL` | 备用 DoH 服务器 | `https://dns.google/dns-query` | ❌ |
+| `TIMEOUT_MS` | 主上游超时时间（毫秒） | `2500` | ❌ |
 
-### 3. 在设备上配置 DoH
+### 平台特定配置
 
-部署完成后，你的 DoH 地址为：
+**Cloudflare Workers/Pages**
+- `BASE_PATH` - 路径前缀（默认：`/dns-query`）
 
-```
-https://<your-worker-name>.<your-subdomain>.workers.dev/<BASE_PATH>
-```
+**Vercel/Netlify Edge Functions**
+- `MOUNT_PATH` - 挂载路径（默认：`/youimark`）
 
-例如：
+## 部署指南
 
-```
-https://nextdns-proxy.example.workers.dev/mysecretpath
-```
+### Cloudflare Workers
 
-将此地址填入你的设备、路由器或浏览器的 DoH 设置中即可。
+```bash
+# 1. 配置 wrangler.toml（NEXTDNS_ID 建议在 Dashboard 中配置，避免暴露在代码仓库）
+cat > wrangler.toml << EOF
+name = "nextdns-proxy"
+main = "_worker.js"
+compatibility_date = "2026-04-01"
 
-NextDNS 支持在路径后附加设备名称，用于在日志中区分不同设备：
+[vars]
+BASE_PATH = "/dns-query"
+EOF
 
-```
-https://nextdns-proxy.example.workers.dev/mysecretpath/my-phone
-```
+# 2. 在 Cloudflare Dashboard 配置环境变量
+#    Workers > nextdns-proxy > Settings > Variables > Add variable
+#    NEXTDNS_ID = your_id_here
 
-## 工作原理
-
-```
-设备发出 DNS 请求（GET 或 POST）
-         ↓
-Cloudflare Worker 接收请求
-         ↓
-从请求头提取真实客户端 IP
-（优先级：EO-Client-IP → ali-real-client-ip → CF-Connecting-IP → X-Forwarded-For → X-Real-IP）
-         ↓
-解码 DNS 报文，在二进制层面注入 ECS
-（IPv4 注入 /24 子网，IPv6 注入 /48 子网，私网 IP 不注入）
-         ↓
-统一转为 POST 转发至随机选中的 NextDNS 上游
-         ↓
-超时或报错？→ 自动切换备用 DoH
-         ↓
-返回 DNS 响应给设备
+# 3. 部署
+wrangler deploy
 ```
 
-## ECS 说明
+### Cloudflare Pages Functions
 
-ECS（EDNS Client Subnet）让 DNS 服务器知道客户端大致位置，从而返回地理位置最优的 CDN 节点。
+```bash
+# 将 _worker.js 和 universal.js 放在 functions/ 目录
+mkdir -p functions
+cp _worker.js universal.js functions/
 
-本 Worker 采用 **DNS 报文层注入**方式，直接在 DNS 二进制报文中写入 ECS option，符合 RFC 7871 标准。这与简单的 URL 参数方式相比更通用，对所有支持 ECS 的 DoH 上游均有效，无需针对每家服务商单独适配。
+# 在 Pages 控制台配置环境变量
+# NEXTDNS_ID = your_id_here
+```
 
-为保护隐私，只传递 IP 子网而非完整 IP：
+### Vercel
 
-- IPv4：注入 `/24`，如 `1.2.3.0/24`
-- IPv6：注入 `/48`，如 `2001:db8:1::/48`
-- 私网 IP（192.168.x.x、10.x.x.x 等）不注入 ECS
+```bash
+# 1. 确保项目结构正确
+# api/youimark.js 已经配置好，会自动导入 universal.js
 
-## CDN 兼容说明
+# 2. 配置环境变量
+vercel env add NEXTDNS_ID
 
-如果在 Worker 前面套了外层 CDN，Worker 会按以下优先级自动识别真实客户端 IP：
+# 3. 部署
+vercel deploy --prod
+```
 
-| 优先级 | 请求头 | 适用场景 |
-|--------|--------|----------|
-| 1 | `EO-Client-IP` | 腾讯 EdgeOne |
-| 2 | `ali-real-client-ip` | 阿里云 CDN |
-| 3 | `CF-Connecting-IP` | 直连 Cloudflare |
-| 4 | `X-Forwarded-For` | 通用代理（取第一个值） |
-| 5 | `X-Real-IP` | 通用兜底 |
+### Netlify
 
-无需任何额外配置，直连和套 CDN 两种场景均可自动正确处理。
+```bash
+# 1. 确保项目结构正确
+# netlify/edge-functions/youimark.js 已经配置好，会自动导入 universal.js
 
-## 响应头说明
+# 2. 配置环境变量（在 Netlify 控制台或 CLI）
+netlify env:set NEXTDNS_ID your_id_here
 
-| 响应头 | 说明 |
-|--------|------|
-| `X-Proxied-By: CF-Worker-NextDNS` | 标识请求经过本 Worker 代理 |
-| `X-Fallback: primary-timeout` | 主上游超时，已切换备用 |
-| `X-Fallback: primary-error` | 主上游报错，已切换备用 |
+# 3. 部署
+netlify deploy --prod
+```
 
-## 常见问题
+## 使用示例
 
-**Q：不设置 `BASE_PATH` 安全吗？**
+### GET 请求（标准 DoH）
 
-默认路径 `/dns-query` 是标准 DoH 路径，任何人都能猜到。建议设置一个随机字符串作为自定义路径，如 `dns-a8f3kz2q`，起到隐藏端点的作用。
+```bash
+# Cloudflare
+curl "https://your-worker.workers.dev/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
 
-**Q：`NEXTDNS_ID` 在哪里找？**
+# Vercel/Netlify
+curl "https://your-domain.com/youimark?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+```
 
-登录 [NextDNS 控制台](https://my.nextdns.io)，进入你的配置，在 **Setup** 页面可以看到你的 DoH 地址，其中最后一段即为你的 ID，如 `https://dns.nextdns.io/a1b2c3` 中的 `a1b2c3`。
+### POST 请求
 
-**Q：如何配置多个 NextDNS ID 分摊额度？**
+```bash
+curl -X POST https://your-domain.com/dns-query \
+  -H "Content-Type: application/dns-message" \
+  --data-binary @dns-query.bin
+```
 
-在 `NEXTDNS_ID` 环境变量中用逗号分隔多个 ID，如 `a1b2c3,d4e5f6`。每次请求会随机选择一个 ID，两个 ID 各占 50% 请求量，以此类推。
+### 带设备 ID
 
-**Q：备用 DoH 可以填哪些？**
+```bash
+# Cloudflare
+curl "https://your-worker.workers.dev/dns-query/my-iphone?dns=..."
 
-任何标准 DoH 地址均可，例如：
+# Vercel（通过 rewrite）
+curl "https://your-domain.com/youimark/my-iphone?dns=..."
 
-- Cloudflare：`https://cloudflare-dns.com/dns-query`
-- Quad9：`https://dns.quad9.net/dns-query`
-- AdGuard：`https://dns.adguard.com/dns-query`
+# Netlify
+curl "https://your-domain.com/youimark/my-iphone?dns=..."
+```
 
-所有支持 ECS 的备用上游都会自动收到 ECS 注入，无需额外配置。
+## 技术细节
 
-**Q：Worker 免费套餐够用吗？**
+### 自动平台检测
 
-Cloudflare Workers 免费套餐每天有 10 万次请求额度，个人使用完全够用。
+```javascript
+const detectPlatform = () => {
+  if (typeof Deno !== 'undefined' && Deno.env) return 'netlify';
+  if (typeof process !== 'undefined' && process.env) return 'vercel';
+  return 'cloudflare';
+};
+```
 
-**Q：可以部署到 Cloudflare Pages 吗？**
+### 统一环境变量读取
 
-可以。代码无需任何修改，同一份代码同时兼容 Worker 和 Pages Functions 两种部署方式。
+```javascript
+const getEnv = (key, env) => {
+  const platform = detectPlatform();
+  if (platform === 'netlify') return Deno.env.get(key);
+  if (platform === 'vercel') return process.env[key];
+  return env?.[key]; // Cloudflare
+};
+```
 
-## License
+### 平台特定 IP 提取
 
-MIT
+```javascript
+const headers = {
+  cloudflare: ['CF-Connecting-IP', 'X-Forwarded-For', 'X-Real-IP'],
+  vercel: ['X-Vercel-Forwarded-For', 'X-Forwarded-For', 'X-Real-IP'],
+  netlify: ['X-Nf-Client-Connection-Ip', 'X-Forwarded-For', 'X-Real-IP'],
+};
+```
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/QSDR2s1d/NextDNS-Cloudflare-Worker)
+## 核心功能
+
+✅ **DNS over HTTPS (DoH)** - RFC 8484 标准协议
+✅ **ECS 注入** - EDNS Client Subnet (RFC 7871)
+✅ **IPv4/IPv6 支持** - 完整的 IP 解析和验证
+✅ **故障转移** - 主上游失败自动切换备用
+✅ **超时控制** - 防止请求挂起
+✅ **安全防护** - 输入验证、路径遍历防护、大小限制
+✅ **CORS 支持** - 跨域请求友好
+✅ **负载均衡** - 多个 NextDNS ID 随机选择
+
+## 安全特性
+
+- **输入验证** - DNS 消息格式、Base64URL 编码检查
+- **路径遍历防护** - 过滤 `..` 和隐藏文件
+- **请求大小限制** - 64KB 上限
+- **响应大小限制** - 64KB 上限，防止恶意上游攻击
+- **超时保护** - 主上游 2.5s，备用 1.5s
+- **错误隔离** - 统一错误处理，不泄露内部信息
+- **公网 IP 检测** - 仅对公网 IP 注入 ECS
+
+## 维护优势
+
+1. **单文件维护** - 只需维护 `universal.js`
+2. **自动适配** - 无需手动指定平台
+3. **向后兼容** - 保持原有文件名和接口
+4. **易于测试** - 核心逻辑集中在一个文件
+5. **代码复用** - 消除重复代码
+
+## 故障排查
+
+### 检查平台检测
+
+在 `universal.js` 开头添加日志：
+
+```javascript
+console.log('Detected platform:', detectPlatform());
+```
+
+### 检查环境变量
+
+```javascript
+console.log('NEXTDNS_ID:', getEnv('NEXTDNS_ID', env));
+```
+
+### 检查客户端 IP
+
+```javascript
+console.log('Client IP:', clientIP);
+```
+
+## 性能优化
+
+- **随机负载均衡** - 多个 NextDNS ID 分散请求
+- **快速故障转移** - 超时后立即切换备用
+- **最小化解析** - 仅在需要时解析 DNS 消息
+- **ECS 缓存** - 避免重复注入

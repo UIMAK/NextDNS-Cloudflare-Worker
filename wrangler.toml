@@ -1,0 +1,28 @@
+name = "nextdns-doh"
+main = "_worker.js"
+compatibility_date = "2026-04-01"
+
+workers_dev = false
+preview_urls = false
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1
+
+# 环境变量配置说明：
+# NEXTDNS_ID 应在 Cloudflare Dashboard > Workers > Settings > Variables 中配置
+# 格式：多个 ID 用逗号分隔，如 "id1,id2,id3"
+# 这样可以避免敏感配置暴露在代码仓库中
+[vars]
+BASE_PATH = "/uimak"

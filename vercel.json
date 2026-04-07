@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/uimak/:device*",
+      "destination": "/api/uimak?__path=:device*"
+    },
+    {
+      "source": "/uimak",
+      "destination": "/api/uimak"
+    }
+  ]
+}
