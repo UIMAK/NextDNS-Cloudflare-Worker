@@ -6,7 +6,7 @@
 //   FALLBACK_URL : 备用 DoH 服务器（默认 https://dns.google/dns-query）
 //   TIMEOUT_MS   : 主上游超时时间（毫秒，默认 2500，最大 30000）
 //   BASE_PATH    : 路径前缀（Cloudflare 用，默认 /dns-query）
-//   MOUNT_PATH   : 挂载路径（Vercel/Netlify 用，默认 /youimark）
+//   MOUNT_PATH   : 挂载路径（Vercel/Netlify 用，默认 /uimak）
 // ================================================================
 
 const NEXTDNS_BASE        = 'https://dns.nextdns.io';
@@ -467,7 +467,7 @@ function parsePath(clientUrl, env) {
   }
   
   const mountPath = (getEnv('MOUNT_PATH', env) || '').replace(/^\/+|\/+$/g, '');
-  const basePath  = `/${mountPath || 'youimark'}`;
+  const basePath  = `/${mountPath || 'uimak'}`;
   if (clientUrl.pathname !== basePath && !clientUrl.pathname.startsWith(basePath + '/')) {
     return { error: 'Not Found', status: 404 };
   }
