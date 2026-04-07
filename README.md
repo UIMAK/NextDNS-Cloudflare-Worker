@@ -29,7 +29,7 @@
 - `BASE_PATH` - 路径前缀（默认：`/dns-query`）
 
 **Vercel/Netlify Edge Functions**
-- `MOUNT_PATH` - 挂载路径（默认：`/youimark`）
+- `MOUNT_PATH` - 挂载路径（默认：`/uimak`）
 
 ## 部署指南
 
@@ -69,7 +69,7 @@ cp _worker.js universal.js functions/
 
 ```bash
 # 1. 确保项目结构正确
-# api/youimark.js 已经配置好，会自动导入 universal.js
+# api/uimak.js 已经配置好，会自动导入 universal.js
 
 # 2. 配置环境变量
 vercel env add NEXTDNS_ID
@@ -82,7 +82,7 @@ vercel deploy --prod
 
 ```bash
 # 1. 确保项目结构正确
-# netlify/edge-functions/youimark.js 已经配置好，会自动导入 universal.js
+# netlify/edge-functions/uimak.js 已经配置好，会自动导入 universal.js
 
 # 2. 配置环境变量（在 Netlify 控制台或 CLI）
 netlify env:set NEXTDNS_ID your_id_here
@@ -100,7 +100,7 @@ netlify deploy --prod
 curl "https://your-worker.workers.dev/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
 
 # Vercel/Netlify
-curl "https://your-domain.com/youimark?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
+curl "https://your-domain.com/uimak?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"
 ```
 
 ### POST 请求
@@ -118,10 +118,10 @@ curl -X POST https://your-domain.com/dns-query \
 curl "https://your-worker.workers.dev/dns-query/my-iphone?dns=..."
 
 # Vercel（通过 rewrite）
-curl "https://your-domain.com/youimark/my-iphone?dns=..."
+curl "https://your-domain.com/uimak/my-iphone?dns=..."
 
 # Netlify
-curl "https://your-domain.com/youimark/my-iphone?dns=..."
+curl "https://your-domain.com/uimak/my-iphone?dns=..."
 ```
 
 ## 技术细节
