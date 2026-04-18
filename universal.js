@@ -16,6 +16,7 @@ const MAX_RESPONSE        = 64 * 1024;
 const DEFAULT_TIMEOUT_MS  = 2500;
 const FALLBACK_TIMEOUT_MS = 1500;
 const MAX_TIMEOUT_MS      = 30000;
+// 注意：这里存储的是前缀长度（单位：bit），而非前缀本身
 const ECS_V4_PREFIX_LEN   = 24;
 const ECS_V6_PREFIX_LEN   = 48;
 
@@ -31,8 +32,10 @@ const UPSTREAM_HEADERS = Object.freeze({
   'Accept':       'application/dns-message',
 });
 
+// 模块级常量：避免每次请求创建临时数组
 const ALLOWED_METHODS = new Set(['GET', 'POST']);
 
+// DNS 协议相关常量提取，消除魔法数字
 const DNS_CONSTANTS = Object.freeze({
   HEADER_SIZE: 12,
   OFFSET_QD: 4,
@@ -55,9 +58,6 @@ const detectPlatform = () => {
 
 const PLATFORM = detectPlatform();
 
-// 预计算代理标识头值，避免每次请求重复拼接字符串
-const PROXY_HEADER_VALUE = `NextDNS-Proxy/${PLATFORM.charAt(0).toUpperCase() + PLATFORM.slice(1)}`;
-
 const getEnv = (key, env) => {
   if (PLATFORM === 'netlify') return Deno.env.get(key);
   if (PLATFORM === 'vercel')  return process.env[key];
@@ -70,6 +70,8 @@ const CLIENT_IP_HEADERS = Object.freeze({
   netlify:    ['EO-Client-IP', 'ali-real-client-ip', 'X-Nf-Client-Connection-Ip', 'X-Forwarded-For', 'X-Real-IP'],
 });
 
+// [修改1] errResp 补充 Content-Type，符合 HTTP 规范
+// 原因：错误响应体是纯文本，浏览器和客户端需要 Content-Type 才能正确解析
 const errResp = (body, status) => new Response(body, {
   status,
   headers: { ...CORS_HEADERS, 'Content-Type': 'text/plain;charset=UTF-8' },
@@ -77,6 +79,7 @@ const errResp = (body, status) => new Response(body, {
 
 const capitalize = str => str.charAt(0).toUpperCase() + str.slice(1);
 
+// 自定义错误工厂，提升代码可维护性
 const createCustomError = (name, message, cause) => {
   const err = new Error(message);
   err.name = name;
@@ -179,6 +182,7 @@ function skipName(buf, off) {
     }
     o += 1 + len;
   }
+  // 到达缓冲区末尾仍未找到结束符（0x00 或压缩指针），说明消息被截断
   throw new RangeError('DNS name label truncated at buffer end');
 }
 
@@ -260,6 +264,8 @@ function buildEcsOption(ipBytes, family, prefixLen) {
   return concatUint8(writeU16BE(DNS_CONSTANTS.ECS_OPTION_CODE), writeU16BE(optData.length), optData);
 }
 
+// [修改2+3] injectECS 接受预解析的 IP 对象，避免在调用链上重复解析同一个 IP 字符串
+// 原因：handleRequest 已用 parseIp() 解析并校验 IP，此处不应再重复解析
 function injectECS(buf, parsedIp) {
   if (!parsedIp) return buf;
   const prefixLen = parsedIp.family === 1 ? ECS_V4_PREFIX_LEN : ECS_V6_PREFIX_LEN;
@@ -277,6 +283,7 @@ function injectECS(buf, parsedIp) {
 
   if (optIdx !== -1) {
     const rec = addRecs[optIdx];
+    // 检查 OPT record 中是否已存在 ECS option
     let p = rec.rdataStart;
     while (p + 4 <= rec.rdataEnd) {
       const code   = readU16(buf, p);
@@ -284,10 +291,12 @@ function injectECS(buf, parsedIp) {
       const optEnd = p + 4 + len;
       if (optEnd > rec.rdataEnd) break;
       if (code === DNS_CONSTANTS.ECS_OPTION_CODE) {
+        // 已有 ECS — 保留上游注入的 ECS，不覆写
         return buf;
       }
       p = optEnd;
     }
+    // 无 ECS — 在已有 OPT rdata 后追加 ECS option
     const existingRdata = buf.slice(rec.rdataStart, rec.rdataEnd);
     const newRdata = concatUint8(existingRdata, ecsOpt);
     return concatUint8(
@@ -336,11 +345,20 @@ const HEX_GROUP = /^[0-9a-fA-F]{1,4}$/;
 function parseIPv6(str) {
   if (typeof str !== 'string') return null;
   let main = str, v4bytes = null;
-  const lastColon = str.lastIndexOf(':'), lastDot = str.lastIndexOf('.');
-  if (lastDot > lastColon) {
+  if (str.includes('.')) {
+    // 字符串含 '.' 说明可能有嵌入 IPv4（如 ::ffff:1.2.3.4 或 64:ff9b::1.2.3.4）
+    // 用 lastIndexOf(':') 找到 IPv4 部分的起始冒号
+    const lastColon = str.lastIndexOf(':');
     v4bytes = parseIPv4(str.slice(lastColon + 1));
     if (!v4bytes) return null;
-    main = str.slice(0, lastColon);
+    // 修复：当 lastColon 前一个字符也是 ':' 时（即 '::' 结构），
+    // main 必须包含第二个冒号才能保留 '::' 标记，否则 split('::') 无法识别省略
+    // 例：'64:ff9b::1.2.3.4' lastColon=8，str[7]=':' => main='64:ff9b::'（含第二个冒号）
+    if (lastColon > 0 && str[lastColon - 1] === ':') {
+      main = str.slice(0, lastColon + 1);
+    } else {
+      main = str.slice(0, lastColon);
+    }
   }
   const parts = main.split('::');
   if (parts.length > 2) return null;
@@ -355,6 +373,8 @@ function parseIPv6(str) {
   const missing    = 8 - groupCount;
   if (!hasElision && missing !== 0) return null;
   if (missing < 0) return null;
+  // hasElision=true 时 :: 必须至少代表一个零组（missing >= 1）；
+  // 若 groupCount > 0 且 missing === 0，说明 :: 什么都没省略，格式非法（RFC 5952）
   if (hasElision && missing === 0 && groupCount > 0) return null;
   const words = [...leftVals, ...Array(missing).fill(0), ...rightVals];
   if (v4bytes) {
@@ -387,6 +407,10 @@ function allZero(buf, start, end) {
   return true;
 }
 
+// [修改3] 将 IP 公网检测拆分为纯 bytes 版本，消除 isPublicIPv6 中的字符串 round-trip
+// 原版：从 bytes 拼成字符串 `${b[2]}.${b[3]}...`，再传给 isPublicIPv4 解析回 bytes，
+// 现版：直接在 bytes 上操作，无需字符串中转
+
 function isPublicIPv4Bytes(b) {
   const n = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
   const inRange = (base, mask) => (n & mask) >>> 0 === (base & mask) >>> 0;
@@ -400,16 +424,24 @@ function isPublicIPv4Bytes(b) {
 
 function isPublicIPv6Bytes(b) {
   const [b0, b1, b2, b3] = b;
-  const isV4Mapped   = allZero(b, 0, 10) && b[10] === 0xff && b[11] === 0xff;
-  const isNAT64      = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && allZero(b, 4, 12);
-  // isLocalNAT64：RFC 8215 定义的本地化 NAT64 前缀（64:ff9b:1::/48）
-  // 注意：按 RFC 6052 /48 后缀算法，IPv4 嵌入在 bytes[7..10]，此处的 allZero(b, 6, 12) 
-  // 检查对合规地址可能不匹配；此处保留原逻辑，兼容将 IPv4 置于 bytes[12..15] 的简化实现
+  const isV4Mapped = allZero(b, 0, 10) && b[10] === 0xff && b[11] === 0xff;
+  // isNAT64：Well-Known 前缀 64:ff9b::/96（RFC 6052），IPv4 嵌入在 bytes[12..15]
+  const isNAT64    = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && allZero(b, 4, 12);
+  // isLocalNAT64：RFC 8215 本地 NAT64 前缀 64:ff9b:1::/48
+  // 按 RFC 6052 Section 2.2 /48 格式：IPv4 分布在 bytes[6..7]（高16位）和 bytes[9..10]（低16位），
+  // byte[8] 为保留零位（u bits）。isNAT64 的 allZero(b,4,12) 已排除 b[4..5]=[0x00,0x01] 的情况，
+  // 因此两者互斥，无需额外交集过滤。
   const isLocalNAT64 = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b
-    && b[4] === 0x00 && b[5] === 0x01 && allZero(b, 6, 12);
-  const is6to4       = b0 === 0x20 && b1 === 0x02;
-  if (isV4Mapped || isNAT64 || isLocalNAT64 || is6to4) {
+    && b[4] === 0x00 && b[5] === 0x01;
+  const is6to4 = b0 === 0x20 && b1 === 0x02;
+  if (isV4Mapped || isNAT64 || is6to4) {
+    // 6to4 的 IPv4 嵌入在 bytes[2..5]；v4-mapped 和 Well-Known NAT64(/96) 在 bytes[12..15]
     const v4Bytes = is6to4 ? b.slice(2, 6) : b.slice(12, 16);
+    return isPublicIPv4Bytes(v4Bytes);
+  }
+  if (isLocalNAT64) {
+    // RFC 6052 /48 前缀格式：IPv4 bytes[0..1] 在 addr[6..7]，bytes[2..3] 在 addr[9..10]
+    const v4Bytes = new Uint8Array([b[6], b[7], b[9], b[10]]);
     return isPublicIPv4Bytes(v4Bytes);
   }
   return !(
@@ -421,6 +453,7 @@ function isPublicIPv6Bytes(b) {
   );
 }
 
+// [修改2] 接受预解析的 IP 对象，由 handleRequest 统一解析后传入，无需重复 parseIp
 function isPublicParsedIp(parsed) {
   if (!parsed) return false;
   return parsed.family === 1
@@ -483,6 +516,11 @@ async function parseDnsRequest(request, clientUrl) {
   if (request.method === 'GET') {
     const dnsParam = clientUrl.searchParams.get('dns');
     if (!dnsParam) return { response: errResp('Missing dns parameter', 400) };
+    // base64url 编码比原始数据膨胀约 4/3 倍；设置与 POST MAX_BODY 等价的上限，
+    // 防止超大参数触发昂贵的正则扫描和内存分配（与 POST 分支的双重校验保持对称）
+    if (dnsParam.length > Math.ceil(MAX_BODY * 4 / 3) + 4) {
+      return { response: errResp('Payload Too Large', 413) };
+    }
     try {
       return { wire: base64urlDecode(dnsParam) };
     } catch (e) {
@@ -517,48 +555,9 @@ async function parseDnsRequest(request, clientUrl) {
   }
 }
 
+// buildResponse 是纯函数，与请求上下文无关，提升为模块级以避免每次请求重复分配
 const buildResponse = ({ body, status, statusText, headers }) =>
   new Response(body, { status, statusText, headers });
-
-// ================================================================
-// 上游请求（模块级纯函数，无隐式闭包依赖）
-// ================================================================
-
-const fetchUpstream = async (upstreamUrl, wire, signal) => {
-  const req = new Request(upstreamUrl, {
-    method: 'POST',
-    headers: UPSTREAM_HEADERS,
-    body: wire,
-    redirect: 'follow',
-    signal,
-  });
-  const response = await fetch(req);
-  if (response.status >= 500) {
-    await response.body?.cancel();
-    throw createCustomError('UpstreamError', `Upstream error: ${response.status}`);
-  }
-  
-  const contentLength = response.headers.get('Content-Length');
-  if (contentLength) {
-    const len = parseInt(contentLength, 10);
-    if (Number.isFinite(len) && len > MAX_RESPONSE) {
-      throw createCustomError('ResponseTooLargeError', `Response too large: ${len} bytes`);
-    }
-  }
-  
-  const body = await response.arrayBuffer();
-  if (body.byteLength > MAX_RESPONSE) {
-    throw createCustomError('ResponseTooLargeError', `Response too large: ${body.byteLength} bytes`);
-  }
-  
-  const respHeaders = new Headers(response.headers);
-  respHeaders.delete('Transfer-Encoding');
-  respHeaders.delete('Content-Encoding');
-  respHeaders.set('Content-Length', body.byteLength.toString());
-  respHeaders.set('X-Proxied-By', PROXY_HEADER_VALUE);
-  respHeaders.set('Access-Control-Allow-Origin', '*');
-  return { body, status: response.status, statusText: response.statusText, headers: respHeaders };
-};
 
 // ================================================================
 // 核心请求处理
@@ -585,6 +584,7 @@ async function handleRequest(request, env, context) {
 
   if (dnsWire.length < DNS_CONSTANTS.HEADER_SIZE) return errResp('Invalid DNS message', 400);
 
+  // [修改2] parseIp 只调用一次，结果复用于公网检测和 ECS 注入，消除原有的双重解析
   const parsedClientIP = parseIp(getClientIP(request.headers, context));
   let mutatedWire = dnsWire;
   if (isPublicParsedIp(parsedClientIP)) {
@@ -595,16 +595,55 @@ async function handleRequest(request, env, context) {
     }
   }
 
+  // tryFetch 接受 wire 作为显式参数，而非捕获外层 mutatedWire 闭包变量，
+  // 使函数输入完全透明，便于测试和后续维护
+  const tryFetch = async (upstreamUrl, wire, signal) => {
+    const req = new Request(upstreamUrl, {
+      method: 'POST',
+      headers: UPSTREAM_HEADERS,
+      body: wire,
+      redirect: 'follow',
+      signal,
+    });
+    const response = await fetch(req);
+    if (response.status >= 500) {
+      // 取消读取 body 以释放资源，避免读入可能较大的错误响应体
+      await response.body?.cancel();
+      throw createCustomError('UpstreamError', `Upstream error: ${response.status}`);
+    }
+    
+    const contentLength = response.headers.get('Content-Length');
+    if (contentLength) {
+      const len = parseInt(contentLength, 10);
+      if (Number.isFinite(len) && len > MAX_RESPONSE) {
+        throw createCustomError('ResponseTooLargeError', `Response too large: ${len} bytes`);
+      }
+    }
+    
+    const body = await response.arrayBuffer();
+    if (body.byteLength > MAX_RESPONSE) {
+      throw createCustomError('ResponseTooLargeError', `Response too large: ${body.byteLength} bytes`);
+    }
+    
+    const respHeaders = new Headers(response.headers);
+    respHeaders.delete('Transfer-Encoding');
+    respHeaders.delete('Content-Encoding');
+    respHeaders.set('Content-Length', body.byteLength.toString());
+    respHeaders.set('X-Proxied-By', `NextDNS-Proxy/${capitalize(PLATFORM)}`);
+    respHeaders.set('Access-Control-Allow-Origin', '*');
+    return { body, status: response.status, statusText: response.statusText, headers: respHeaders };
+  };
+
   const selectedId  = config.ids[Math.floor(Math.random() * config.ids.length)];
   const primaryUrl  = new URL(`${NEXTDNS_BASE}/${selectedId}${encodeDevicePath(pathResult.devicePath)}`);
 
   try {
-    const result = await withTimeout(signal => fetchUpstream(primaryUrl, mutatedWire, signal), config.primaryTimeoutMs);
+    const result = await withTimeout(signal => tryFetch(primaryUrl, mutatedWire, signal), config.primaryTimeoutMs);
     return buildResponse(result);
   } catch (primaryErr) {
     console.warn('Primary upstream failed:', primaryErr.message);
     try {
-      const result = await withTimeout(signal => fetchUpstream(config.fallbackUrl, mutatedWire, signal), FALLBACK_TIMEOUT_MS);
+      const result = await withTimeout(signal => tryFetch(config.fallbackUrl, mutatedWire, signal), FALLBACK_TIMEOUT_MS);
       result.headers.set('X-Fallback', primaryErr.name === 'TimeoutError' ? 'primary-timeout' : 'primary-error');
       return buildResponse(result);
     } catch (fallbackErr) {
