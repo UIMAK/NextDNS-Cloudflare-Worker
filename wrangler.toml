@@ -11,7 +11,7 @@ enabled = true
 invocation_logs = true
 
 [observability.traces]
-enabled = true
+enabled = false
 
 # 环境变量配置说明：
 # NEXTDNS_ID 应在 Cloudflare Dashboard > Workers > Settings > Variables 中配置
