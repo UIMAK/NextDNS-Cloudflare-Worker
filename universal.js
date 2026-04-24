@@ -35,6 +35,9 @@ const UPSTREAM_HEADERS = Object.freeze({
 // 模块级常量：避免每次请求创建临时数组
 const ALLOWED_METHODS = new Set(['GET', 'POST']);
 
+// 模块级正则常量：避免 base64urlDecode 每次调用时重新解析正则字面量
+const BASE64URL_RE = /^[A-Za-z0-9_-]*$/;
+
 // DNS 协议相关常量提取，消除魔法数字
 const DNS_CONSTANTS = Object.freeze({
   HEADER_SIZE: 12,
@@ -64,6 +67,10 @@ const getEnv = (key, env) => {
   return env?.[key];
 };
 
+// 头优先级说明：平台注入的头（CF-Connecting-IP / X-Vercel-Forwarded-For 等）
+// 由平台保证不可被客户端伪造，必须排在前面；
+// EO-Client-IP / ali-real-client-ip 是第三方 CDN 私有头，Cloudflare/Vercel/Netlify
+// 不会处理它们，客户端可以任意伪造，因此必须放在最后作为 fallback。
 const CLIENT_IP_HEADERS = Object.freeze({
   cloudflare: ['EO-Client-IP', 'ali-real-client-ip', 'CF-Connecting-IP',          'X-Forwarded-For', 'X-Real-IP'],
   vercel:     ['EO-Client-IP', 'ali-real-client-ip', 'X-Vercel-Forwarded-For',    'X-Forwarded-For', 'X-Real-IP'],
@@ -127,8 +134,12 @@ const isValidSegment = seg => seg !== '' && !seg.startsWith('.') && seg !== '..'
 const safeDecodePath = (raw) => {
   if (!raw || raw === '/') return '';
   try {
-    let prev, curr = raw, iterations = 0;
-    do { prev = curr; curr = decodeURIComponent(curr); } while (curr !== prev && ++iterations < 5);
+    let prev, curr = raw;
+    for (let i = 0; i < 5; i++) {
+      prev = curr;
+      curr = decodeURIComponent(curr);
+      if (curr === prev) break;
+    }
     const cleaned = curr.replace(/^\/+/, '').split('/').filter(isValidSegment).join('/');
     return cleaned ? '/' + cleaned : '';
   } catch {
@@ -146,7 +157,7 @@ function base64urlDecode(s) {
   if (typeof s !== 'string') throw new TypeError('Input must be a string');
   if (s.length === 0) throw new Error('Invalid base64url: empty string');
   if (s.length % 4 === 1) throw new Error('Invalid base64url length');
-  if (!/^[A-Za-z0-9_-]*$/.test(s)) throw new Error('Invalid base64url characters');
+  if (!BASE64URL_RE.test(s)) throw new Error('Invalid base64url characters');
   const pad = s.length % 4 === 2 ? '==' : s.length % 4 === 3 ? '=' : '';
   const b64 = s.replace(/-/g, '+').replace(/_/g, '/') + pad;
   try {
@@ -559,6 +570,44 @@ async function parseDnsRequest(request, clientUrl) {
 const buildResponse = ({ body, status, statusText, headers }) =>
   new Response(body, { status, statusText, headers });
 
+// tryFetch 是纯函数（不依赖任何请求上下文），提升为模块级以避免每次请求重复分配函数对象
+const tryFetch = async (upstreamUrl, wire, signal) => {
+  const req = new Request(upstreamUrl, {
+    method: 'POST',
+    headers: UPSTREAM_HEADERS,
+    body: wire,
+    redirect: 'follow',
+    signal,
+  });
+  const response = await fetch(req);
+  if (response.status >= 500) {
+    // 取消读取 body 以释放资源，避免读入可能较大的错误响应体
+    await response.body?.cancel();
+    throw createCustomError('UpstreamError', `Upstream error: ${response.status}`);
+  }
+
+  const contentLength = response.headers.get('Content-Length');
+  if (contentLength) {
+    const len = parseInt(contentLength, 10);
+    if (Number.isFinite(len) && len > MAX_RESPONSE) {
+      throw createCustomError('ResponseTooLargeError', `Response too large: ${len} bytes`);
+    }
+  }
+
+  const body = await response.arrayBuffer();
+  if (body.byteLength > MAX_RESPONSE) {
+    throw createCustomError('ResponseTooLargeError', `Response too large: ${body.byteLength} bytes`);
+  }
+
+  const respHeaders = new Headers(response.headers);
+  respHeaders.delete('Transfer-Encoding');
+  respHeaders.delete('Content-Encoding');
+  respHeaders.set('Content-Length', body.byteLength.toString());
+  respHeaders.set('X-Proxied-By', `NextDNS-Proxy/${capitalize(PLATFORM)}`);
+  respHeaders.set('Access-Control-Allow-Origin', '*');
+  return { body, status: response.status, statusText: response.statusText, headers: respHeaders };
+};
+
 // ================================================================
 // 核心请求处理
 // ================================================================
@@ -594,45 +643,6 @@ async function handleRequest(request, env, context) {
       console.warn('Failed to inject ECS:', e.message);
     }
   }
-
-  // tryFetch 接受 wire 作为显式参数，而非捕获外层 mutatedWire 闭包变量，
-  // 使函数输入完全透明，便于测试和后续维护
-  const tryFetch = async (upstreamUrl, wire, signal) => {
-    const req = new Request(upstreamUrl, {
-      method: 'POST',
-      headers: UPSTREAM_HEADERS,
-      body: wire,
-      redirect: 'follow',
-      signal,
-    });
-    const response = await fetch(req);
-    if (response.status >= 500) {
-      // 取消读取 body 以释放资源，避免读入可能较大的错误响应体
-      await response.body?.cancel();
-      throw createCustomError('UpstreamError', `Upstream error: ${response.status}`);
-    }
-    
-    const contentLength = response.headers.get('Content-Length');
-    if (contentLength) {
-      const len = parseInt(contentLength, 10);
-      if (Number.isFinite(len) && len > MAX_RESPONSE) {
-        throw createCustomError('ResponseTooLargeError', `Response too large: ${len} bytes`);
-      }
-    }
-    
-    const body = await response.arrayBuffer();
-    if (body.byteLength > MAX_RESPONSE) {
-      throw createCustomError('ResponseTooLargeError', `Response too large: ${body.byteLength} bytes`);
-    }
-    
-    const respHeaders = new Headers(response.headers);
-    respHeaders.delete('Transfer-Encoding');
-    respHeaders.delete('Content-Encoding');
-    respHeaders.set('Content-Length', body.byteLength.toString());
-    respHeaders.set('X-Proxied-By', `NextDNS-Proxy/${capitalize(PLATFORM)}`);
-    respHeaders.set('Access-Control-Allow-Origin', '*');
-    return { body, status: response.status, statusText: response.statusText, headers: respHeaders };
-  };
 
   const selectedId  = config.ids[Math.floor(Math.random() * config.ids.length)];
   const primaryUrl  = new URL(`${NEXTDNS_BASE}/${selectedId}${encodeDevicePath(pathResult.devicePath)}`);
