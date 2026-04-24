@@ -67,14 +67,10 @@ const getEnv = (key, env) => {
   return env?.[key];
 };
 
-// 头优先级说明：平台注入的头（CF-Connecting-IP / X-Vercel-Forwarded-For 等）
-// 由平台保证不可被客户端伪造，必须排在前面；
-// EO-Client-IP / ali-real-client-ip 是第三方 CDN 私有头，Cloudflare/Vercel/Netlify
-// 不会处理它们，客户端可以任意伪造，因此必须放在最后作为 fallback。
 const CLIENT_IP_HEADERS = Object.freeze({
-  cloudflare: ['EO-Client-IP', 'ali-real-client-ip', 'CF-Connecting-IP',          'X-Forwarded-For', 'X-Real-IP'],
-  vercel:     ['EO-Client-IP', 'ali-real-client-ip', 'X-Vercel-Forwarded-For',    'X-Forwarded-For', 'X-Real-IP'],
-  netlify:    ['EO-Client-IP', 'ali-real-client-ip', 'X-Nf-Client-Connection-Ip', 'X-Forwarded-For', 'X-Real-IP'],
+  cloudflare: ['EO-Client-IP', 'ali-real-client-ip', 'X-Forwarded-For', 'CF-Connecting-IP',          ],
+  vercel:     ['EO-Client-IP', 'ali-real-client-ip', 'X-Forwarded-For', 'X-Vercel-Forwarded-For',    ],
+  netlify:    ['EO-Client-IP', 'ali-real-client-ip', 'X-Forwarded-For', 'X-Nf-Client-Connection-Ip', ],
 });
 
 // [修改1] errResp 补充 Content-Type，符合 HTTP 规范
