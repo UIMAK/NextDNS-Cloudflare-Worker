@@ -40,14 +40,17 @@ const BASE64URL_RE = /^[A-Za-z0-9_-]*$/;
 
 // DNS 协议相关常量提取，消除魔法数字
 const DNS_CONSTANTS = Object.freeze({
-  HEADER_SIZE: 12,
-  OFFSET_QD: 4,
-  OFFSET_AN: 6,
-  OFFSET_NS: 8,
-  OFFSET_AR: 10,
-  TYPE_OPT: 41,
-  ECS_OPTION_CODE: 8
+  HEADER_SIZE:     12,
+  OFFSET_QD:        4,
+  OFFSET_AN:        6,
+  OFFSET_NS:        8,
+  OFFSET_AR:       10,
+  TYPE_OPT:        41,
+  ECS_OPTION_CODE:  8,
 });
+
+// safeDecodePath 解码迭代上限
+const MAX_DECODE_PASSES = 5;
 
 // ================================================================
 // 平台检测（模块加载时一次性执行，结果缓存为常量 PLATFORM）
@@ -73,8 +76,6 @@ const CLIENT_IP_HEADERS = Object.freeze({
   netlify:    ['EO-Client-IP', 'ali-real-client-ip', 'X-Forwarded-For', 'X-Nf-Client-Connection-Ip', ],
 });
 
-// [修改1] errResp 补充 Content-Type，符合 HTTP 规范
-// 原因：错误响应体是纯文本，浏览器和客户端需要 Content-Type 才能正确解析
 const errResp = (body, status) => new Response(body, {
   status,
   headers: { ...CORS_HEADERS, 'Content-Type': 'text/plain;charset=UTF-8' },
@@ -110,16 +111,26 @@ const withTimeout = async (fetchFn, ms) => {
   }
 };
 
+// stripIPv6Brackets：统一剥离 IPv6 字面量的方括号
+// 使用 /^\[(.*)\]$/ 确保只处理成对括号，畸形输入（如 [::1 或 ::1]）原样返回，
+// 后续 parseIp 会返回 null，ECS 不注入，安全降级。
+// 将正则提取为具名函数，消除 getClientIP 内两处处理相同问题
+const IPV6_BRACKET_RE = /^\[(.*)\]$/;
+const stripIPv6Brackets = ip => ip.replace(IPV6_BRACKET_RE, '$1');
+
 const getClientIP = (headers, context) => {
   if (PLATFORM === 'netlify' && context?.ip) {
-    const ip = context.ip.trim().replace(/^\[|\]$/g, '');
-    if (ip) return ip;
+    const ip = context.ip.trim();
+    // Netlify context.ip 对 IPv6 可能带方括号（如 [::1]）
+    const stripped = stripIPv6Brackets(ip);
+    if (stripped) return stripped;
   }
   const headersToCheck = CLIENT_IP_HEADERS[PLATFORM] ?? CLIENT_IP_HEADERS.cloudflare;
   for (const name of headersToCheck) {
     const val = headers.get(name);
     if (!val) continue;
-    const ip = val.split(',')[0].trim().replace(/^\[|\]$/g, '');
+    // HTTP 头部 X-Forwarded-For 等字段取第一个 IP，再统一剥括号
+    const ip = stripIPv6Brackets(val.split(',')[0].trim());
     if (ip) return ip;
   }
   return null;
@@ -131,7 +142,7 @@ const safeDecodePath = (raw) => {
   if (!raw || raw === '/') return '';
   try {
     let prev, curr = raw;
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < MAX_DECODE_PASSES; i++) {
       prev = curr;
       curr = decodeURIComponent(curr);
       if (curr === prev) break;
@@ -168,7 +179,8 @@ function base64urlDecode(s) {
 // ================================================================
 
 function readU16(buf, off) {
-  if (off < 0 || off + 1 >= buf.length) throw new RangeError('readU16 out of bounds');
+  // 改为 off + 2 > buf.length，更清晰地表达"需要2字节，不够就越界"。
+  if (off < 0 || off + 2 > buf.length) throw new RangeError('readU16 out of bounds');
   return (buf[off] << 8) | buf[off + 1];
 }
 
@@ -271,8 +283,6 @@ function buildEcsOption(ipBytes, family, prefixLen) {
   return concatUint8(writeU16BE(DNS_CONSTANTS.ECS_OPTION_CODE), writeU16BE(optData.length), optData);
 }
 
-// [修改2+3] injectECS 接受预解析的 IP 对象，避免在调用链上重复解析同一个 IP 字符串
-// 原因：handleRequest 已用 parseIp() 解析并校验 IP，此处不应再重复解析
 function injectECS(buf, parsedIp) {
   if (!parsedIp) return buf;
   const prefixLen = parsedIp.family === 1 ? ECS_V4_PREFIX_LEN : ECS_V6_PREFIX_LEN;
@@ -414,10 +424,6 @@ function allZero(buf, start, end) {
   return true;
 }
 
-// [修改3] 将 IP 公网检测拆分为纯 bytes 版本，消除 isPublicIPv6 中的字符串 round-trip
-// 原版：从 bytes 拼成字符串 `${b[2]}.${b[3]}...`，再传给 isPublicIPv4 解析回 bytes，
-// 现版：直接在 bytes 上操作，无需字符串中转
-
 function isPublicIPv4Bytes(b) {
   const n = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
   const inRange = (base, mask) => (n & mask) >>> 0 === (base & mask) >>> 0;
@@ -460,7 +466,6 @@ function isPublicIPv6Bytes(b) {
   );
 }
 
-// [修改2] 接受预解析的 IP 对象，由 handleRequest 统一解析后传入，无需重复 parseIp
 function isPublicParsedIp(parsed) {
   if (!parsed) return false;
   return parsed.family === 1
@@ -475,9 +480,12 @@ function isPublicParsedIp(parsed) {
 function parseConfig(env) {
   const idsStr = getEnv('NEXTDNS_ID', env) || '';
   if (!idsStr.trim()) return { error: 'Server misconfiguration: NEXTDNS_ID not set' };
+  // 【我的改动】保留原始 .trim() 移除说明：
+  // .replace(/[^a-zA-Z0-9_-]/g, '') 已覆盖空白字符，.trim() 确实冗余，移除正确。
+  // 注意：上一行 idsStr.trim() 的作用是检测整个字符串是否纯空白，与此处不同，不可删。
   const ids = idsStr
     .split(',')
-    .map(s => s.trim().replace(/[^a-zA-Z0-9_-]/g, ''))
+    .map(s => s.replace(/[^a-zA-Z0-9_-]/g, ''))
     .filter(Boolean);
   if (ids.length === 0) return { error: 'Server misconfiguration: No valid NEXTDNS_ID found' };
   
@@ -629,7 +637,7 @@ async function handleRequest(request, env, context) {
 
   if (dnsWire.length < DNS_CONSTANTS.HEADER_SIZE) return errResp('Invalid DNS message', 400);
 
-  // [修改2] parseIp 只调用一次，结果复用于公网检测和 ECS 注入，消除原有的双重解析
+  // parseIp 只调用一次，结果复用于公网检测和 ECS 注入，消除双重解析
   const parsedClientIP = parseIp(getClientIP(request.headers, context));
   let mutatedWire = dnsWire;
   if (isPublicParsedIp(parsedClientIP)) {
