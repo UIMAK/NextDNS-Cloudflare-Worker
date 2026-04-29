@@ -40,13 +40,14 @@ const BASE64URL_RE = /^[A-Za-z0-9_-]*$/;
 
 // DNS 协议相关常量提取，消除魔法数字
 const DNS_CONSTANTS = Object.freeze({
-  HEADER_SIZE:     12,
-  OFFSET_QD:        4,
-  OFFSET_AN:        6,
-  OFFSET_NS:        8,
-  OFFSET_AR:       10,
-  TYPE_OPT:        41,
-  ECS_OPTION_CODE:  8,
+  HEADER_SIZE:           12,
+  OFFSET_QD:              4,
+  OFFSET_AN:              6,
+  OFFSET_NS:              8,
+  OFFSET_AR:             10,
+  TYPE_OPT:              41,
+  ECS_OPTION_CODE:        8,
+  EDNS_UDP_PAYLOAD_SIZE:  4096,
 });
 
 // safeDecodePath 解码迭代上限
@@ -179,7 +180,6 @@ function base64urlDecode(s) {
 // ================================================================
 
 function readU16(buf, off) {
-  // 改为 off + 2 > buf.length，更清晰地表达"需要2字节，不够就越界"。
   if (off < 0 || off + 2 > buf.length) throw new RangeError('readU16 out of bounds');
   return (buf[off] << 8) | buf[off + 1];
 }
@@ -327,7 +327,7 @@ function injectECS(buf, parsedIp) {
   const optRecord = concatUint8(
     new Uint8Array([0x00]),
     writeU16BE(DNS_CONSTANTS.TYPE_OPT),
-    writeU16BE(4096),
+    writeU16BE(DNS_CONSTANTS.EDNS_UDP_PAYLOAD_SIZE),
     new Uint8Array([0, 0, 0, 0]),
     writeU16BE(ecsOpt.length),
     ecsOpt
@@ -435,11 +435,24 @@ function isPublicIPv4Bytes(b) {
   );
 }
 
+// 非公网 IPv6 前缀匹配器表。
+// 每个条目是一个 (b: Uint8Array) => boolean 谓词，b 为完整 16 字节地址。
+const NON_PUBLIC_IPV6_CHECKS = Object.freeze([
+  b => allZero(b, 0, 16),                                                         // :: (unspecified)
+  b => allZero(b, 0, 15) && b[15] === 1,                                         // ::1 (loopback)
+  b => (b[0] & 0xfe) === 0xfc,                                                    // fc00::/7 (ULA, RFC 4193)
+  b => b[0] === 0xfe && (b[1] & 0xc0) === 0x80,                                  // fe80::/10 (link-local, RFC 4291)
+  b => b[0] === 0xff,                                                              // ff00::/8 (multicast)
+  b => b[0] === 0x20 && b[1] === 0x01 && b[2] === 0x0d && b[3] === 0xb8,         // 2001:db8::/32 (documentation, RFC 3849)
+  b => b[0] === 0x20 && b[1] === 0x01 && b[2] === 0x00 && (b[3] & 0xf0) === 0x10, // 2001:10::/28 (deprecated)
+  b => b[0] === 0x20 && b[1] === 0x01 && b[2] === 0x00 && (b[3] & 0xf0) === 0x20, // 2001:20::/28 (deprecated)
+]);
+
 function isPublicIPv6Bytes(b) {
   const [b0, b1, b2, b3] = b;
   const isV4Mapped = allZero(b, 0, 10) && b[10] === 0xff && b[11] === 0xff;
   // isNAT64：Well-Known 前缀 64:ff9b::/96（RFC 6052），IPv4 嵌入在 bytes[12..15]
-  const isNAT64    = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && allZero(b, 4, 12);
+  const isNAT64 = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && allZero(b, 4, 12);
   // isLocalNAT64：RFC 8215 本地 NAT64 前缀 64:ff9b:1::/48
   // 按 RFC 6052 Section 2.2 /48 格式：IPv4 分布在 bytes[6..7]（高16位）和 bytes[9..10]（低16位），
   // byte[8] 为保留零位（u bits）。isNAT64 的 allZero(b,4,12) 已排除 b[4..5]=[0x00,0x01] 的情况，
@@ -457,13 +470,7 @@ function isPublicIPv6Bytes(b) {
     const v4Bytes = new Uint8Array([b[6], b[7], b[9], b[10]]);
     return isPublicIPv4Bytes(v4Bytes);
   }
-  return !(
-    allZero(b, 0, 16) || (allZero(b, 0, 15) && b[15] === 1) ||
-    (b0 & 0xfe) === 0xfc || (b0 === 0xfe && (b1 & 0xc0) === 0x80) ||
-    b0 === 0xff || (b0 === 0x20 && b1 === 0x01 && b2 === 0x0d && b3 === 0xb8) ||
-    (b0 === 0x20 && b1 === 0x01 && b2 === 0x00 && (b3 & 0xf0) === 0x10) ||
-    (b0 === 0x20 && b1 === 0x01 && b2 === 0x00 && (b3 & 0xf0) === 0x20)
-  );
+  return !NON_PUBLIC_IPV6_CHECKS.some(fn => fn(b));
 }
 
 function isPublicParsedIp(parsed) {
@@ -480,9 +487,6 @@ function isPublicParsedIp(parsed) {
 function parseConfig(env) {
   const idsStr = getEnv('NEXTDNS_ID', env) || '';
   if (!idsStr.trim()) return { error: 'Server misconfiguration: NEXTDNS_ID not set' };
-  // 【我的改动】保留原始 .trim() 移除说明：
-  // .replace(/[^a-zA-Z0-9_-]/g, '') 已覆盖空白字符，.trim() 确实冗余，移除正确。
-  // 注意：上一行 idsStr.trim() 的作用是检测整个字符串是否纯空白，与此处不同，不可删。
   const ids = idsStr
     .split(',')
     .map(s => s.replace(/[^a-zA-Z0-9_-]/g, ''))
